@@ -1,4 +1,6 @@
-use crate::trae::{TraeEditor, TraeEditorMode};
+use crate::config::Config;
+use crate::trae::editor::TraeEditor;
+use crate::trae::types::TraeEditorMode;
 use crate::utils::{wait_for_debug_port, wait_for_shutdown};
 use anyhow::Result;
 use chromiumoxide::Browser;
@@ -7,15 +9,16 @@ use std::process::Stdio;
 use tokio::process::Command;
 use tokio::time::Duration;
 
-pub mod strings;
+pub mod config;
+pub mod consts;
 pub mod trae;
 pub mod utils;
 
-const TRAE_BINARY_PATH: &'static str = "D:/Trae/Trae.exe";
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut trae_main = Command::new(TRAE_BINARY_PATH)
+    let config = Config::load()?;
+
+    let mut trae_main = Command::new(config.trae_executable_path)
         .arg("--remote-debugging-port=9222")
         .arg("--no-sandbox")
         .stdout(Stdio::null()) // inherit current stream
@@ -23,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .kill_on_drop(true)
         .spawn()?;
 
-    let trae_pid = trae_main.id().expect("Cannot get Trae PID.");
+    // let trae_pid = trae_main.id().expect("Cannot get Trae PID.");
 
     println!("Hello, world!");
 
