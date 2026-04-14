@@ -10,30 +10,44 @@ pub enum TraeEditorPrebuiltSoloAgent {
     Builder,
 }
 
-// state struct
-#[derive(Debug)]
-pub struct Interrupted;
-#[derive(Debug)]
-pub struct Running;
-#[derive(Debug)]
-pub struct WaitingForHITL;
-#[derive(Debug)]
-pub struct Finished;
-#[derive(Debug)]
-pub struct Idle;
-
-pub trait TaskState {}
-impl TaskState for Interrupted {}
-impl TaskState for Running {}
-impl TaskState for WaitingForHITL {}
-impl TaskState for Finished {}
-impl TaskState for Idle {}
-
-pub trait Action {}
-impl Action for Interrupted {}
-impl Action for Finished {}
-
 pub enum TraeSoloTaskFeedback {
     Good,
     Bad,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum TraeTaskStatus {
+    Idle,
+    Running,
+    Interrupted,
+    WaitingForHITL,
+    Finished,
+}
+
+#[derive(Debug, Clone)]
+pub struct TraeTask {
+    pub title: String,
+    pub status: TraeTaskStatus,
+    pub selected: bool,
+}
+
+impl TraeTask {
+    pub fn is_running(&self) -> bool {
+        matches!(self.status, TraeTaskStatus::Running)
+    }
+
+    pub fn is_finished(&self) -> bool {
+        matches!(self.status, TraeTaskStatus::Finished)
+    }
+
+    pub fn is_waiting_for_hitl(&self) -> bool {
+        matches!(self.status, TraeTaskStatus::WaitingForHITL)
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.status,
+            TraeTaskStatus::Interrupted | TraeTaskStatus::Finished
+        )
+    }
 }

@@ -5,7 +5,9 @@ use anyhow::Result;
 use chromiumoxide::Browser;
 use futures::StreamExt;
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::process::Command;
+use tokio::sync::watch;
 use tokio::time::Duration;
 
 pub mod config;
@@ -83,29 +85,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut trae_editor = trae_editor_builder.build(&mut browser).await;
 
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
     println!("Current Trae Mode: {:?}", trae_editor.mode);
     // switch mode
     trae_editor.switch_editor_mode(TraeEditorMode::SOLO).await?;
 
     // create a new task
-    let task = trae_editor
-        .create_new_task("创建一个个人简历网站".to_string())
-        .await;
+    {
+        let task = trae_editor
+            .create_new_task("创建一个个人简历网站".to_string())
+            .await;
 
-    // execute task
-    match task.execute().await {
-        Ok(_) => println!("✅️ Task executed successfully."),
-        Err(e) => eprintln!("Task execution failed: {e}"),
+        // execute task
+        match task.execute().await {
+            Ok(_) => println!("✅️ Task executed successfully."),
+            Err(e) => eprintln!("Task execution failed: {e}"),
+        }
     }
 
     // get tasks from panel
+    let arc_editor = Arc::new(trae_editor);
+    let arc_editor_for_loop = Arc::clone(&arc_editor);
 
-    let tasks = trae_editor.get_tasks().await?;
+    tokio::spawn(async move {
+        arc_editor_for_loop
+            .run_task_sync_loop(Duration::from_secs(2), shutdown_rx)
+            .await;
+    });
 
-    println!("Tasks: {:#?}", { tasks });
+    let tasks = arc_editor.cached_tasks().await;
+
+    println!("Tasks: {:#?}", tasks);
 
     // receive ctrl+c signal
     wait_for_shutdown().await?;
+
+    // stop fetching
+    let _ = shutdown_tx.send(true);
 
     // close browser
     browser.close().await?;

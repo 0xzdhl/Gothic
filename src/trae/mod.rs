@@ -3,6 +3,6 @@ mod task;
 mod types;
 
 // re-export sub modules
-pub use types::*;
-pub use task::*;
 pub use editor::*;
+pub use task::*;
+pub use types::*;

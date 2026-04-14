@@ -1,12 +1,12 @@
 use crate::config::Config;
 use crate::consts::*;
-use crate::trae::task::{TraeSoloTask, TraeSoloTaskInner};
-use crate::trae::types::*;
+use crate::trae::{NewTraeTask, TraeTask, TraeTaskStatus, types::*};
 use crate::utils::{normalize_executable_path_for_cdp, wait_for_selector};
 use anyhow::{Error, Result};
 use chromiumoxide::{Browser, Page, cdp::browser_protocol::target::TargetInfo};
-use std::marker::PhantomData;
-use tokio::time::{Duration, sleep};
+use tokio::sync::RwLock;
+use tokio::sync::watch::Receiver;
+use tokio::time::{self, Duration, sleep};
 
 #[derive(Debug)]
 pub struct TraeEditor {
@@ -14,6 +14,7 @@ pub struct TraeEditor {
     pub(crate) target: TargetInfo,
     pub(crate) prebuilt_agent: TraeEditorPrebuiltSoloAgent,
     pub(crate) mode: TraeEditorMode,
+    pub(crate) tasks: RwLock<Vec<TraeTask>>,
 }
 
 pub async fn get_current_editor_mode(page: &Page) -> Result<TraeEditorMode, Error> {
@@ -82,6 +83,7 @@ impl TraeEditorBuilder {
             main_page: main_page,
             prebuilt_agent: TraeEditorPrebuiltSoloAgent::Coder,
             mode: current_mode,
+            tasks: RwLock::new(Vec::new()),
         };
     }
 }
@@ -89,6 +91,10 @@ impl TraeEditorBuilder {
 impl TraeEditor {
     pub fn new() -> TraeEditorBuilder {
         TraeEditorBuilder {}
+    }
+
+    pub fn get_current_mode(&self) -> &TraeEditorMode {
+        &self.mode
     }
 
     pub async fn get_main_page(&self) -> &Page {
@@ -117,8 +123,8 @@ impl TraeEditor {
         Ok(())
     }
 
-    pub async fn create_new_task<'a>(&'a self, prompt: String) -> TraeSoloTask<'a> {
-        TraeSoloTask::Idle(TraeSoloTaskInner::<Idle>::new(prompt, self))
+    pub async fn create_new_task(&self, prompt: impl Into<String>) -> NewTraeTask<'_> {
+        NewTraeTask::new(self, prompt.into())
     }
 
     pub fn set_default_prebuilt_solo_agent(&mut self, agent: TraeEditorPrebuiltSoloAgent) {
@@ -130,10 +136,8 @@ impl TraeEditor {
     }
 
     // private methods
-
     // get tasks from sidebar
-    // TODO
-    pub async fn get_tasks(&'_ self) -> Result<Vec<TraeSoloTask<'_>>, Error> {
+    pub async fn fetch_tasks_from_ui(&self) -> Result<Vec<TraeTask>, Error> {
         if self.mode != TraeEditorMode::SOLO {
             return Err(Error::msg(
                 "Cannot get tasks under IDE mode, please switch to SOLO mode.",
@@ -151,16 +155,18 @@ impl TraeEditor {
             .await
             .expect("Cannot get task items from container.");
 
-        let mut tasks: Vec<TraeSoloTask> = Vec::new();
-        // TODO
-        // 1. WaitingForHITL
-        // 2. Finished
-        for t in task_items.iter() {
-            let raw_task_state = t
-                .find_element("div[class*=task-type-wrap")
+        let mut tasks: Vec<TraeTask> = Vec::with_capacity(task_items.len());
+
+        for item in task_items.iter() {
+            let class_name = item.attribute("class").await?.unwrap_or_default();
+
+            let selected = class_name.contains("selected");
+
+            let raw_task_state = item
+                .find_element("div[class*=task-type-wrap__status]")
                 .await
-                .expect(&format!("Cannot get task type: {:#?}", t))
-                .inner_html()
+                .expect(&format!("Cannot get task type: {:#?}", item))
+                .inner_text()
                 .await
                 .unwrap_or_default()
                 .unwrap_or_else(|| {
@@ -168,10 +174,10 @@ impl TraeEditor {
                     return "".to_string();
                 });
 
-            let task_title = t
+            let title = item
                 .find_element("span[class*=task-title]")
                 .await
-                .expect(&format!("Cannot get task title: {:#?}", t))
+                .expect(&format!("Cannot get task title: {:#?}", item))
                 .inner_html()
                 .await
                 .unwrap_or_default()
@@ -180,30 +186,65 @@ impl TraeEditor {
                     return "".to_string();
                 });
 
-            let task = match raw_task_state.as_str() {
-                TRAE_SOLO_TASK_INTERRUPTED_LABEL => TraeSoloTask::Interrupted(TraeSoloTaskInner {
-                    _state: PhantomData,
-                    editor: self,
-                    prompt: None,
-                    title: task_title,
-                }),
-                TRAE_SOLO_TASK_RUNNING_LABEL => TraeSoloTask::Running(TraeSoloTaskInner {
-                    _state: PhantomData,
-                    editor: self,
-                    prompt: None,
-                    title: task_title,
-                }),
-                _ => TraeSoloTask::Idle(TraeSoloTaskInner {
-                    _state: PhantomData,
-                    editor: self,
-                    prompt: None,
-                    title: task_title,
-                }),
+            let status = match raw_task_state.as_str() {
+                TRAE_SOLO_TASK_RUNNING_LABEL => TraeTaskStatus::Running,
+                TRAE_SOLO_TASK_INTERRUPTED_LABEL => TraeTaskStatus::Interrupted,
+                TRAE_SOLO_TASK_FINISHED_LABEL => TraeTaskStatus::Finished,
+                TRAE_SOLO_TASK_WAITING_FOR_HITL_LABEL => TraeTaskStatus::WaitingForHITL,
+                _ => TraeTaskStatus::Idle,
             };
 
-            tasks.push(task);
+            tasks.push(TraeTask {
+                title,
+                status,
+                selected,
+            });
         }
 
         Ok(tasks)
+    }
+
+    pub async fn refresh_tasks(&self) -> Result<Vec<TraeTask>, Error> {
+        let latest = self.fetch_tasks_from_ui().await?;
+
+        let mut guard = self.tasks.write().await;
+        *guard = latest.clone();
+
+        Ok(latest)
+    }
+
+    pub async fn cached_tasks(&self) -> Vec<TraeTask> {
+        self.tasks.read().await.clone()
+    }
+
+    pub async fn run_task_sync_loop(&self, interval: Duration, mut shutdown_rx: Receiver<bool>) {
+        let _ = self.refresh_tasks().await;
+
+        let mut ticker = time::interval(interval);
+        ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+
+        ticker.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if let Err(err) = self.refresh_tasks().await {
+                        eprintln!("refresh_tasks failed: {err:?}");
+                    }
+                }
+                changed = shutdown_rx.changed() => {
+                    match changed {
+                        Ok(_) => {
+                            if *shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
