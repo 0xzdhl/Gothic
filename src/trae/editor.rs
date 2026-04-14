@@ -213,6 +213,24 @@ impl TraeEditor {
         Ok(latest)
     }
 
+    /// Get latest Trae tasks from UI.
+    pub async fn get_tasks(&self) -> Result<Vec<TraeTask>, Error> {
+        let latest = self.fetch_tasks_from_ui().await?;
+        let mut guard = self.tasks.write().await;
+        *guard = latest.clone();
+
+        Ok(latest)
+    }
+
+    // pub async fn find_task_by(&self, title: &str, status: Option<TraeTaskStatus>) -> Option<TraeTask> {
+    //     let guard = self.tasks.read().await;
+    //     guard.iter().find(|t| {
+    //         match status {
+                
+    //         }
+    //     }).cloned()
+    // }
+
     pub async fn cached_tasks(&self) -> Vec<TraeTask> {
         self.tasks.read().await.clone()
     }
