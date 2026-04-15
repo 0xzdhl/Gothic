@@ -8,7 +8,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::watch;
-use tokio::time::Duration;
+use tokio::time::{Duration, sleep};
 
 pub mod config;
 pub mod consts;
@@ -50,37 +50,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // navigate to home page
-    // let infos = browser.fetch_targets().await?;
-    // println!("Discover: {} targets.", infos.len());
-    // println!("{:?}", infos.first().unwrap());
-
-    // // sleep a little while
-    // sleep(Duration::from_millis(300)).await;
-
-    // let pages = browser.pages().await?;
-
-    // println!("Discover: {} pages.", pages.len());
-
-    // // get the first page, generally there will be only one page available
-
-    // let page = pages
-    //     .into_iter()
-    //     .next()
-    //     .ok_or("Cannot get the main page of Trae.")?;
-
-    // // get the current MODE = IDE or SOLO
-    // let trae_mode_badge_element = page.find_element("div.fixed-titlebar-container div.icube-mode-tab > div.icube-tooltip-container > div.icube-tooltip-text.icube-simple-style").await.expect("Cannot locate Trae editor mode badge.");
-
-    // let mode_description = trae_mode_badge_element
-    //     .inner_html()
-    //     .await
-    //     .expect("Cannot get the Trae mode badge text node")
-    //     .expect("Cannot get Trae mode text description.");
-
-    // 执行其他自动化操作
-    // ...
-
     let trae_editor_builder = TraeEditor::new();
 
     let mut trae_editor = trae_editor_builder.build(&mut browser).await;
@@ -93,15 +62,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // create a new task
     {
-        let task = trae_editor
-            .create_new_task("创建一个个人简历网站".to_string())
-            .await;
-
-        // execute task
-        match task.execute().await {
-            Ok(_) => println!("✅️ Task executed successfully."),
-            Err(e) => eprintln!("Task execution failed: {e}"),
-        }
+        quick_task("创建一个个人简历网站", &trae_editor).await;
+        quick_task("帮我做一个淘宝网，我需要全部的功能", &trae_editor).await;
+        quick_task(
+            "写一个小红书脚本，抓取特定关键词的热门帖子数据",
+            &trae_editor,
+        )
+        .await;
+        quick_task("我想要做一个二手交易网站，我该怎么设计？", &trae_editor).await;
+        quick_task(
+            "我是一个编程小白, 我想要学习Typescript, 我该从哪里开始?",
+            &trae_editor,
+        )
+        .await;
     }
 
     // get tasks from panel
@@ -117,6 +90,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tasks = arc_editor.cached_tasks().await;
 
     println!("Tasks: {:#?}", tasks);
+
+    // click the second task
+    sleep(Duration::from_millis(2000)).await;
+    if tasks.len() > 2 {
+        let second_task = tasks.get(1).unwrap();
+        let second_task_handler = arc_editor
+            .get_task_handle_by_index(second_task.index)
+            .await?;
+
+        // trigger selection
+        second_task_handler.select().await?;
+
+        // try type something in it
+        second_task_handler.type_content("fuck everything.").await?;
+    }
+
     // receive ctrl+c signal
     wait_for_shutdown().await?;
 
@@ -132,4 +121,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = trae_main.wait().await?;
 
     Ok(())
+}
+
+async fn quick_task(prompt: &str, editor: &TraeEditor) {
+    let task = editor.create_new_task(prompt.to_string()).await;
+
+    // execute task
+    match task.execute().await {
+        Ok(_) => println!("✅️ Task executed successfully. ({})", prompt),
+        Err(e) => eprintln!("Task execution failed: {e}"),
+    }
+
+    // sleep 1 sec
+    sleep(Duration::from_millis(1000)).await;
 }

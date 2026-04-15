@@ -3,6 +3,7 @@ use crate::consts::*;
 use crate::trae::{NewTraeTask, TraeTask, TraeTaskStatus, types::*};
 use crate::utils::{normalize_executable_path_for_cdp, wait_for_selector};
 use anyhow::{Error, Result};
+use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
 use chromiumoxide::{Browser, Page, cdp::browser_protocol::target::TargetInfo};
 use tokio::sync::RwLock;
 use tokio::sync::watch::Receiver;
@@ -144,11 +145,13 @@ impl TraeEditor {
             ));
         }
 
-        let task_container = self
-            .main_page
-            .find_element("#solo-ai-sidebar-content div[class*=task-items-list]")
-            .await
-            .expect("Cannot get task container.");
+        let task_container = wait_for_selector(
+            &self.main_page,
+            "#solo-ai-sidebar-content div[class*=task-items-list]",
+            Duration::from_millis(DEFAULT_SELECTOR_TIMEOUT),
+        )
+        .await
+        .expect("Cannot get task container.");
 
         let task_items = task_container
             .find_elements(r#"div[class*="index-module__task-item___"#)
@@ -223,7 +226,24 @@ impl TraeEditor {
         Ok(latest)
     }
 
-    pub async fn click_task_item_by_index(&self, index: usize) -> Result<(), Error> {
+    async fn get_task_by_index(&self, index: usize) -> Result<TraeTask, Error> {
+        let latest_tasks = self.get_tasks().await?;
+
+        let target = latest_tasks.get(index).unwrap().clone();
+
+        Ok(target)
+    }
+
+    pub async fn get_task_handle_by_index(
+        &self,
+        index: usize,
+    ) -> Result<TraeTaskHandler<'_>, Error> {
+        let task = self.get_task_by_index(index).await?;
+        Ok(TraeTaskHandler::new(self, task))
+    }
+
+    /// Operations
+    pub async fn select_task_by_index(&self, index: usize) -> Result<(), Error> {
         let task_container = self
             .main_page
             .find_element("#solo-ai-sidebar-content div[class*=task-items-list]")
@@ -235,7 +255,7 @@ impl TraeEditor {
             .await
             .expect("Cannot get task items from container.");
 
-        let target_task_item = task_items.get(index as usize);
+        let target_task_item = task_items.get(index);
 
         match target_task_item {
             Some(element) => {
@@ -249,14 +269,36 @@ impl TraeEditor {
         Ok(())
     }
 
-    // pub async fn find_task_by(&self, title: &str, status: Option<TraeTaskStatus>) -> Option<TraeTask> {
-    //     let guard = self.tasks.read().await;
-    //     guard.iter().find(|t| {
-    //         match status {
+    pub async fn type_content_to_chat_input(&self, content: &str) -> Result<(), Error> {
+        let chat_input_element = wait_for_selector(
+            &self.main_page,
+            "#agent-chat-view div.chat-input-wrapper div.chat-input-v2-input-box-editable",
+            Duration::from_millis(1000 * 60),
+        )
+        .await?;
 
-    //         }
-    //     }).cloned()
-    // }
+        chat_input_element.click().await?;
+
+        self.main_page
+            .execute(InsertTextParams::new(content))
+            .await?;
+
+        sleep(Duration::from_millis(100)).await;
+
+        Ok(())
+    }
+
+    async fn copy_task_summary_by_index(&self) -> Result<(), Error> {
+        todo!()
+    }
+
+    async fn feedback_task_by_index(&self, feedback: TraeSoloTaskFeedback) {
+        todo!()
+    }
+
+    async fn retry_task_by_index(&self) {
+        todo!()
+    }
 
     pub async fn cached_tasks(&self) -> Vec<TraeTask> {
         self.tasks.read().await.clone()
