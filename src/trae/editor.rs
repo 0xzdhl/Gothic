@@ -5,6 +5,7 @@ use crate::utils::{normalize_executable_path_for_cdp, wait_for_selector};
 use anyhow::{Error, Result};
 use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
 use chromiumoxide::{Browser, Page, cdp::browser_protocol::target::TargetInfo};
+use enigo::{Enigo, Key, Keyboard, Settings};
 use serde::Deserialize;
 use tokio::sync::RwLock;
 use tokio::sync::watch::Receiver;
@@ -293,13 +294,32 @@ impl TraeEditor {
     }
 
     pub async fn type_content_to_chat_input(&self, content: &str) -> Result<(), Error> {
+        // clear the content
+        let chat_input_selector =
+            r"#agent-chat-view div.chat-input-wrapper div.chat-input-v2-input-box-editable";
+
         let chat_input_element = wait_for_selector(
             &self.main_page,
-            "#agent-chat-view div.chat-input-wrapper div.chat-input-v2-input-box-editable",
+            chat_input_selector,
             Duration::from_millis(1000 * 60),
         )
         .await?;
 
+        // focus
+        chat_input_element.click().await?;
+
+        let mut enigo = Enigo::new(&Settings::default())?;
+
+        // Key combo: Ctrl+A and delete
+        enigo.key(Key::Control, enigo::Direction::Press)?;
+        enigo.key(Key::A, enigo::Direction::Press)?;
+        enigo.key(Key::Backspace, enigo::Direction::Click)?;
+        enigo.key(Key::A, enigo::Direction::Release)?;
+        enigo.key(Key::Control, enigo::Direction::Release)?;
+
+        sleep(Duration::from_millis(500)).await;
+
+        // focus
         chat_input_element.click().await?;
 
         self.main_page

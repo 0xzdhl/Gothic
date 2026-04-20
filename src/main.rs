@@ -118,6 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
 
         let text_summary = third_task_handler.copy_summary().await?;
+        third_task_handler.type_content("test content").await?;
 
         println!("The text summary of the third task: {}", text_summary);
     }
