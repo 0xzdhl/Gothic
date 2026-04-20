@@ -1,5 +1,6 @@
 use crate::trae::TraeEditor;
 use anyhow::Error;
+use arboard::Clipboard;
 
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub enum TraeEditorMode {
@@ -102,5 +103,33 @@ impl<'a> TraeTaskHandler<'a> {
 
     pub async fn type_content(&self, content: &str) -> Result<(), Error> {
         self.editor.type_content_to_chat_input(content).await
+    }
+
+    pub async fn copy_summary(&self) -> Result<String, Error> {
+        // switch to target task item
+        let _ = self.select().await?;
+
+        let _ = self.editor.copy_task_summary_by_index(self.index()).await?;
+
+        // read summary from clipboard
+        let mut clipboard = Clipboard::new()?;
+
+        let clipboard_text = clipboard.get_text()?;
+
+        Ok(clipboard_text)
+    }
+
+    pub async fn retry_task(&self) -> Result<(), Error> {
+        // switch to target task item
+        let _ = self.select().await?;
+        self.editor.retry_task_by_index(self.index()).await
+    }
+
+    pub async fn feedback(&self, feedback: TraeSoloTaskFeedback) -> Result<(), Error> {
+        // switch to target task item
+        let _ = self.select().await?;
+        self.editor
+            .feedback_task_by_index(self.index(), feedback)
+            .await
     }
 }

@@ -311,16 +311,81 @@ impl TraeEditor {
         Ok(())
     }
 
-    async fn copy_task_summary_by_index(&self) -> Result<(), Error> {
-        todo!()
+    async fn is_interoperable(&self, index: usize) -> Result<(), Error> {
+        let task = self.get_task_by_index(index).await?;
+
+        match task.status {
+            TraeTaskStatus::Finished | TraeTaskStatus::Interrupted => Ok(()),
+            _ => {
+                return Err(Error::msg(
+                    "Actions can only be trigger under Finished/Interrupted status.",
+                ));
+            }
+        }
     }
 
-    async fn feedback_task_by_index(&self, feedback: TraeSoloTaskFeedback) {
-        todo!()
+    pub async fn copy_task_summary_by_index(&self, index: usize) -> Result<(), Error> {
+        // status guard
+        self.is_interoperable(index).await?;
+
+        let copy_summary_button = wait_for_selector(
+            &self.main_page,
+            "button[aria-label=复制全部]",
+            Duration::from_millis(DEFAULT_SELECTOR_TIMEOUT),
+        )
+        .await?;
+
+        copy_summary_button.click().await?;
+        Ok(())
     }
 
-    async fn retry_task_by_index(&self) {
-        todo!()
+    pub async fn feedback_task_by_index(
+        &self,
+        index: usize,
+        feedback: TraeSoloTaskFeedback,
+    ) -> Result<(), Error> {
+        // status guard
+        self.is_interoperable(index).await?;
+
+        match feedback {
+            TraeSoloTaskFeedback::Good => {
+                let feedback_good_button = wait_for_selector(
+                    &self.main_page,
+                    "button[aria-label=赞]",
+                    Duration::from_millis(DEFAULT_SELECTOR_TIMEOUT),
+                )
+                .await?;
+
+                feedback_good_button.click().await?;
+            }
+            TraeSoloTaskFeedback::Bad => {
+                let feedback_bad_button = wait_for_selector(
+                    &self.main_page,
+                    "button[aria-label=踩]",
+                    Duration::from_millis(DEFAULT_SELECTOR_TIMEOUT),
+                )
+                .await?;
+
+                feedback_bad_button.click().await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn retry_task_by_index(&self, index: usize) -> Result<(), Error> {
+        // status guard
+        self.is_interoperable(index).await?;
+
+        let retry_button = wait_for_selector(
+            &self.main_page,
+            "button[aria-label=重试]",
+            Duration::from_millis(DEFAULT_SELECTOR_TIMEOUT),
+        )
+        .await?;
+
+        retry_button.click().await?;
+        Ok(())
     }
 
     pub async fn cached_tasks(&self) -> Vec<TraeTask> {

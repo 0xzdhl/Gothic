@@ -61,22 +61,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     trae_editor.switch_editor_mode(TraeEditorMode::SOLO).await?;
 
     // create a new task
-    {
-        quick_task("创建一个个人简历网站", &trae_editor).await;
-        quick_task("帮我做一个淘宝网，我需要全部的功能", &trae_editor).await;
-        quick_task(
-            "写一个小红书脚本，抓取特定关键词的热门帖子数据",
-            &trae_editor,
-        )
-        .await;
-        quick_task("我想要做一个二手交易网站，我该怎么设计？", &trae_editor).await;
-        quick_task(
-            "我是一个编程小白, 我想要学习Typescript, 我该从哪里开始?",
-            &trae_editor,
-        )
-        .await;
-    }
+    // {
+    //     quick_task("创建一个个人简历网站", &trae_editor).await;
+    //     quick_task("帮我做一个淘宝网，我需要全部的功能", &trae_editor).await;
+    //     quick_task(
+    //         "写一个小红书脚本，抓取特定关键词的热门帖子数据",
+    //         &trae_editor,
+    //     )
+    //     .await;
+    //     quick_task("我想要做一个二手交易网站，我该怎么设计？", &trae_editor).await;
+    //     quick_task(
+    //         "我是一个编程小白, 我想要学习Typescript, 我该从哪里开始?",
+    //         &trae_editor,
+    //     )
+    //     .await;
+    // }
 
+    // sleep 3 secs
+    sleep(Duration::from_millis(3000)).await;
     // get tasks from panel
     let arc_editor = Arc::new(trae_editor);
     let arc_editor_for_loop = Arc::clone(&arc_editor);
@@ -87,13 +89,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await;
     });
 
+    // sleep 3 secs
+    sleep(Duration::from_millis(3000)).await;
+
     let tasks = arc_editor.cached_tasks().await;
 
     println!("Tasks: {:#?}", tasks);
 
     // click the second task
-    sleep(Duration::from_millis(2000)).await;
-    if tasks.len() > 2 {
+
+    if tasks.len() > 3 {
         let second_task = tasks.get(1).unwrap();
         let second_task_handler = arc_editor
             .get_task_handle_by_index(second_task.index)
@@ -104,6 +109,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // try type something in it
         second_task_handler.type_content("fuck everything.").await?;
+
+        // switch to third item, copy summary text
+
+        let third_task = tasks.get(2).unwrap();
+        let third_task_handler = arc_editor
+            .get_task_handle_by_index(third_task.index)
+            .await?;
+
+        let text_summary = third_task_handler.copy_summary().await?;
+
+        println!("The text summary of the third task: {}", text_summary);
     }
 
     // receive ctrl+c signal
