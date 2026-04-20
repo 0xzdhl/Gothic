@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::trae::{TraeEditor, TraeEditorMode};
+use crate::trae::{ActionChain, CustomActionExample, TaskWorkflow, TraeEditor, TraeEditorMode};
 use crate::utils::{wait_for_debug_port, wait_for_shutdown};
 use anyhow::Result;
 use chromiumoxide::Browser;
@@ -61,21 +61,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     trae_editor.switch_editor_mode(TraeEditorMode::SOLO).await?;
 
     // create a new task
-    // {
-    //     quick_task("创建一个个人简历网站", &trae_editor).await;
-    //     quick_task("帮我做一个淘宝网，我需要全部的功能", &trae_editor).await;
-    //     quick_task(
-    //         "写一个小红书脚本，抓取特定关键词的热门帖子数据",
-    //         &trae_editor,
-    //     )
-    //     .await;
-    //     quick_task("我想要做一个二手交易网站，我该怎么设计？", &trae_editor).await;
-    //     quick_task(
-    //         "我是一个编程小白, 我想要学习Typescript, 我该从哪里开始?",
-    //         &trae_editor,
-    //     )
-    //     .await;
-    // }
+    {
+        quick_task("翻译：我喜欢使用Python编程为日语。", &trae_editor).await;
+        // quick_task("帮我做一个淘宝网，我需要全部的功能", &trae_editor).await;
+        // quick_task(
+        //     "写一个小红书脚本，抓取特定关键词的热门帖子数据",
+        //     &trae_editor,
+        // )
+        // .await;
+        // quick_task("我想要做一个二手交易网站，我该怎么设计？", &trae_editor).await;
+        // quick_task(
+        //     "我是一个编程小白, 我想要学习Typescript, 我该从哪里开始?",
+        //     &trae_editor,
+        // )
+        // .await;
+    }
 
     // sleep 3 secs
     sleep(Duration::from_millis(3000)).await;
@@ -83,9 +83,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arc_editor = Arc::new(trae_editor);
     let arc_editor_for_loop = Arc::clone(&arc_editor);
 
+    let workflow = build_task_workflow();
+
     tokio::spawn(async move {
         arc_editor_for_loop
-            .run_task_sync_loop(Duration::from_secs(2), shutdown_rx)
+            .run_task_sync_loop(Duration::from_secs(2), workflow, shutdown_rx)
             .await;
     });
 
@@ -112,15 +114,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // switch to third item, copy summary text
 
-        let third_task = tasks.get(2).unwrap();
-        let third_task_handler = arc_editor
-            .get_task_handle_by_index(third_task.index)
-            .await?;
+        // let third_task = tasks.get(2).unwrap();
+        // let third_task_handler = arc_editor
+        //     .get_task_handle_by_index(third_task.index)
+        //     .await?;
 
-        let text_summary = third_task_handler.copy_summary().await?;
-        third_task_handler.type_content("test content").await?;
+        // let text_summary = third_task_handler.copy_summary().await?;
+        // third_task_handler.type_content("test content").await?;
 
-        println!("The text summary of the third task: {}", text_summary);
+        // println!("The text summary of the third task: {}", text_summary);
     }
 
     // receive ctrl+c signal
@@ -151,4 +153,22 @@ async fn quick_task(prompt: &str, editor: &TraeEditor) {
 
     // sleep 1 sec
     sleep(Duration::from_millis(3000)).await;
+}
+
+fn build_task_workflow() -> TaskWorkflow {
+    TaskWorkflow {
+        on_finished: ActionChain::new().focus_task().custom(CustomActionExample),
+
+        on_interrupted: ActionChain::new()
+            .focus_task()
+            .focus_chat_input()
+            .clear_chat_input()
+            .type_text("任务中断了，请说明阻塞点和下一步建议。")
+            .press_enter(),
+
+        on_waiting_for_hitl: ActionChain::new()
+            .focus_task()
+            .wait_for_selector(r#"button[data-testid="hitl-primary-button"]"#, 30_000)
+            .click_selector(r#"button[data-testid="hitl-primary-button"]"#),
+    }
 }
