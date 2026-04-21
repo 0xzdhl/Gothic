@@ -3,21 +3,6 @@
 version = 4
 
 [[package]]
-name = "Trae-autonomous"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arboard",
- "async-openai",
- "chromiumoxide",
- "enigo",
- "futures",
- "jsonc-parser",
- "serde",
- "tokio",
-]
-
-[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -629,6 +614,21 @@ dependencies = [
  "r-efi",
  "wasip2",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "gothic"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "async-openai",
+ "chromiumoxide",
+ "enigo",
+ "futures",
+ "jsonc-parser",
+ "serde",
+ "tokio",
 ]
 
 [[package]]
