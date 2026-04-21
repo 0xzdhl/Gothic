@@ -38,7 +38,7 @@ pub async fn execute_action_chain(
             ActionOp::FocusChatInput => editor.focus_chat_input().await?,
             ActionOp::ClearChatInput => editor.clear_chat_input().await?,
             ActionOp::TypeText(text) => editor.insert_text_to_focused_input(text).await?,
-            ActionOp::PressEnter => editor.press_enter().await?,
+            ActionOp::PressEnter => editor.click_send_button_by_index(task.index).await?,
             ActionOp::ClickSelector(selector) => editor.click_element_by_selector(selector).await?,
             ActionOp::ClickButtonByText(text) => editor.click_button_by_text(text).await?,
             ActionOp::WaitForSelector {
