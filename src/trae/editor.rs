@@ -1,10 +1,14 @@
 use crate::config::Config;
 use crate::consts::*;
-use crate::trae::{NewTraeTask, TraeTask, TraeTaskStatus, types::*};
+use crate::trae::{
+    NewTraeTask, TraeTask, TraeTaskStatus, diff_task_status_changes, handle_task_status_change,
+    types::*,
+};
 use crate::utils::{normalize_executable_path_for_cdp, wait_for_selector};
 use anyhow::{Error, Result};
 use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
 use chromiumoxide::{Browser, Page, cdp::browser_protocol::target::TargetInfo};
+use enigo::{Enigo, Key, Keyboard, Settings};
 use serde::Deserialize;
 use tokio::sync::RwLock;
 use tokio::sync::watch::Receiver;
@@ -44,6 +48,32 @@ pub async fn get_current_editor_mode(page: &Page) -> Result<TraeEditorMode, Erro
             "Cannot get the current editor mode, description: {}",
             mode_description
         )))
+    }
+}
+
+fn parse_task_status(raw_status: &str) -> TraeTaskStatus {
+    match raw_status {
+        TRAE_SOLO_TASK_RUNNING_LABEL => TraeTaskStatus::Running,
+        TRAE_SOLO_TASK_INTERRUPTED_LABEL => TraeTaskStatus::Interrupted,
+        TRAE_SOLO_TASK_FINISHED_LABEL => TraeTaskStatus::Finished,
+        TRAE_SOLO_TASK_WAITING_FOR_HITL_LABEL => TraeTaskStatus::WaitingForHITL,
+        _ => TraeTaskStatus::Idle,
+    }
+}
+
+fn build_task_key(task_id: Option<&str>, title: &str, ordinal: usize) -> String {
+    if let Some(task_id) = task_id {
+        let task_id = task_id.trim();
+        if !task_id.is_empty() {
+            return format!("id:{task_id}");
+        }
+    }
+
+    let title = title.trim();
+    if title.is_empty() {
+        format!("title:__empty__#{ordinal}")
+    } else {
+        format!("title:{title}#{ordinal}")
     }
 }
 
@@ -153,14 +183,6 @@ impl TraeEditor {
             ));
         }
 
-        // let task_container = wait_for_selector(
-        //     &self.main_page,
-        //     "#solo-ai-sidebar-content div[class*=task-items-list]",
-        //     Duration::from_millis(DEFAULT_SELECTOR_TIMEOUT),
-        // )
-        // .await
-        // .expect("Cannot get task container.");
-
         let _ = wait_for_selector(
             &self.main_page,
             r#"div[class*=index-module__task-item___]"#,
@@ -169,42 +191,32 @@ impl TraeEditor {
         .await
         .expect("Cannot get task items from page.");
 
-        // Read the list in a single browser-side snapshot to avoid stale
-        // Element handles when the sidebar re-renders between awaits.
         let task_snapshots: Vec<TaskSnapshotFromUi> = self
             .main_page
             .evaluate(
                 r#"
-                Array.from(document.querySelectorAll('div[class*="index-module__task-item___"]'))
-                  .map((item) => {
-                    const titleElement = item.querySelector('span[class*="task-title"]');
-                    const statusElement = item.querySelector('div[class*="task-type-wrap__status"]');
+        Array.from(document.querySelectorAll('div[class*="index-module__task-item___"]'))
+          .map((item) => {
+            const titleElement = item.querySelector('span[class*="task-title"]');
+            const statusElement = item.querySelector('div[class*="task-type-wrap__status"]');
 
-                    return {
-                      title: (titleElement?.textContent ?? '').trim(),
-                      raw_status: (statusElement?.innerText ?? '').trim(),
-                      selected: item.className.includes('selected'),
-                    };
-                  })
-                "#,
+            return {
+              title: (titleElement?.textContent ?? '').trim(),
+              raw_status: (statusElement?.innerText ?? '').trim(),
+              selected: item.className.includes('selected'),
+            };
+          })
+        "#,
             )
             .await?
             .into_value()?;
 
-        let mut tasks: Vec<TraeTask> = Vec::with_capacity(task_snapshots.len());
+        let mut tasks = Vec::with_capacity(task_snapshots.len());
 
         for (index, snapshot) in task_snapshots.into_iter().enumerate() {
-            let status = match snapshot.raw_status.as_str() {
-                TRAE_SOLO_TASK_RUNNING_LABEL => TraeTaskStatus::Running,
-                TRAE_SOLO_TASK_INTERRUPTED_LABEL => TraeTaskStatus::Interrupted,
-                TRAE_SOLO_TASK_FINISHED_LABEL => TraeTaskStatus::Finished,
-                TRAE_SOLO_TASK_WAITING_FOR_HITL_LABEL => TraeTaskStatus::WaitingForHITL,
-                _ => TraeTaskStatus::Idle,
-            };
-
             tasks.push(TraeTask {
-                title: snapshot.title,
-                status,
+                title: snapshot.title.trim().to_string(),
+                status: parse_task_status(snapshot.raw_status.as_str()),
                 selected: snapshot.selected,
                 index,
             });
@@ -220,6 +232,121 @@ impl TraeEditor {
         *guard = latest.clone();
 
         Ok(latest)
+    }
+
+    pub async fn refresh_tasks_with_events(&self) -> Result<Vec<TaskStatusChangeEvent>, Error> {
+        let previous = self.cached_tasks().await;
+        let latest = self.fetch_tasks_from_ui().await?;
+        let events = diff_task_status_changes(&previous, &latest);
+
+        let mut guard = self.tasks.write().await;
+        *guard = latest;
+
+        Ok(events)
+    }
+
+    pub async fn focus_task_by_index(&self, index: usize) -> Result<(), Error> {
+        self.select_task_by_index(index).await?;
+        sleep(Duration::from_millis(300)).await;
+        Ok(())
+    }
+
+    pub async fn focus_chat_input(&self) -> Result<(), Error> {
+        let chat_input_element = wait_for_selector(
+            &self.main_page,
+            "#agent-chat-view div.chat-input-wrapper div.chat-input-v2-input-box-editable",
+            Duration::from_millis(1000 * 60),
+        )
+        .await?;
+
+        chat_input_element.click().await?;
+        sleep(Duration::from_millis(100)).await;
+        Ok(())
+    }
+
+    pub async fn clear_chat_input(&self) -> Result<(), Error> {
+        self.focus_chat_input().await?;
+
+        let mut enigo = Enigo::new(&Settings::default())?;
+        enigo.key(Key::Control, enigo::Direction::Press)?;
+        enigo.key(Key::A, enigo::Direction::Click)?;
+        enigo.key(Key::Control, enigo::Direction::Release)?;
+        sleep(Duration::from_millis(100)).await;
+        enigo.key(Key::Backspace, enigo::Direction::Click)?;
+        sleep(Duration::from_millis(200)).await;
+
+        Ok(())
+    }
+
+    pub async fn insert_text_to_focused_input(&self, content: &str) -> Result<(), Error> {
+        self.main_page
+            .execute(InsertTextParams::new(content))
+            .await?;
+        sleep(Duration::from_millis(100)).await;
+        Ok(())
+    }
+
+    pub async fn press_enter(&self) -> Result<(), Error> {
+        let mut enigo = Enigo::new(&Settings::default())?;
+        enigo.key(Key::Return, enigo::Direction::Click)?;
+        sleep(Duration::from_millis(200)).await;
+        Ok(())
+    }
+
+    pub async fn wait_until_selector(&self, selector: &str, timeout_ms: u64) -> Result<(), Error> {
+        let _ =
+            wait_for_selector(&self.main_page, selector, Duration::from_millis(timeout_ms)).await?;
+        Ok(())
+    }
+
+    pub async fn click_element_by_selector(&self, selector: &str) -> Result<(), Error> {
+        let element = wait_for_selector(
+            &self.main_page,
+            selector,
+            Duration::from_millis(DEFAULT_SELECTOR_TIMEOUT),
+        )
+        .await?;
+
+        element.click().await?;
+        sleep(Duration::from_millis(300)).await;
+        Ok(())
+    }
+
+    pub async fn click_button_by_text(&self, button_text: &str) -> Result<(), Error> {
+        let button_text_literal = format!("{button_text:?}");
+
+        let clicked: bool = self
+            .main_page
+            .evaluate(format!(
+                r#"
+        (() => {{
+            const expectedText = {button_text_literal}.trim();
+            const candidates = Array.from(document.querySelectorAll('button, [role="button"]'));
+            const target = candidates.find(
+                (node) => (node.innerText ?? '').trim() === expectedText
+            );
+
+            if (!target) {{
+                return false;
+            }}
+
+            target.click();
+            return true;
+        }})()
+        "#
+            ))
+            .await?
+            .into_value()?;
+
+        if !clicked {
+            return Err(Error::msg(format!(
+                "Cannot find button by text: {}",
+                button_text
+            )));
+        }
+
+        sleep(Duration::from_millis(300)).await;
+        Ok(())
     }
 
     /// Get latest Trae tasks from UI.
@@ -293,65 +420,132 @@ impl TraeEditor {
     }
 
     pub async fn type_content_to_chat_input(&self, content: &str) -> Result<(), Error> {
-        let chat_input_element = wait_for_selector(
-            &self.main_page,
-            "#agent-chat-view div.chat-input-wrapper div.chat-input-v2-input-box-editable",
-            Duration::from_millis(1000 * 60),
-        )
-        .await?;
-
-        chat_input_element.click().await?;
-
-        self.main_page
-            .execute(InsertTextParams::new(content))
-            .await?;
-
-        sleep(Duration::from_millis(100)).await;
+        self.focus_chat_input().await?;
+        self.clear_chat_input().await?;
+        self.insert_text_to_focused_input(content).await?;
 
         Ok(())
     }
 
-    async fn copy_task_summary_by_index(&self) -> Result<(), Error> {
-        todo!()
+    async fn is_interoperable(&self, index: usize) -> Result<(), Error> {
+        let task = self.get_task_by_index(index).await?;
+
+        match task.status {
+            TraeTaskStatus::Finished | TraeTaskStatus::Interrupted => Ok(()),
+            _ => {
+                return Err(Error::msg(
+                    "Actions can only be trigger under Finished/Interrupted status.",
+                ));
+            }
+        }
     }
 
-    async fn feedback_task_by_index(&self, feedback: TraeSoloTaskFeedback) {
-        todo!()
+    pub async fn copy_task_summary_by_index(&self, index: usize) -> Result<(), Error> {
+        // status guard
+        self.is_interoperable(index).await?;
+
+        let copy_summary_button = wait_for_selector(
+            &self.main_page,
+            "button[aria-label=复制全部]",
+            Duration::from_millis(DEFAULT_SELECTOR_TIMEOUT),
+        )
+        .await?;
+
+        copy_summary_button.click().await?;
+        Ok(())
     }
 
-    async fn retry_task_by_index(&self) {
-        todo!()
+    pub async fn feedback_task_by_index(
+        &self,
+        index: usize,
+        feedback: TraeSoloTaskFeedback,
+    ) -> Result<(), Error> {
+        // status guard
+        self.is_interoperable(index).await?;
+
+        match feedback {
+            TraeSoloTaskFeedback::Good => {
+                let feedback_good_button = wait_for_selector(
+                    &self.main_page,
+                    "button[aria-label=赞]",
+                    Duration::from_millis(DEFAULT_SELECTOR_TIMEOUT),
+                )
+                .await?;
+
+                feedback_good_button.click().await?;
+            }
+            TraeSoloTaskFeedback::Bad => {
+                let feedback_bad_button = wait_for_selector(
+                    &self.main_page,
+                    "button[aria-label=踩]",
+                    Duration::from_millis(DEFAULT_SELECTOR_TIMEOUT),
+                )
+                .await?;
+
+                feedback_bad_button.click().await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn retry_task_by_index(&self, index: usize) -> Result<(), Error> {
+        // status guard
+        self.is_interoperable(index).await?;
+
+        let retry_button = wait_for_selector(
+            &self.main_page,
+            "button[aria-label=重试]",
+            Duration::from_millis(DEFAULT_SELECTOR_TIMEOUT),
+        )
+        .await?;
+
+        retry_button.click().await?;
+        Ok(())
     }
 
     pub async fn cached_tasks(&self) -> Vec<TraeTask> {
         self.tasks.read().await.clone()
     }
 
-    pub async fn run_task_sync_loop(&self, interval: Duration, mut shutdown_rx: Receiver<bool>) {
+    pub async fn run_task_sync_loop(
+        &self,
+        interval: Duration,
+        workflow: TaskWorkflow,
+        mut shutdown_rx: Receiver<bool>,
+    ) {
         let _ = self.refresh_tasks().await;
 
         let mut ticker = time::interval(interval);
         ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-
         ticker.tick().await;
 
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    if let Err(err) = self.refresh_tasks().await {
-                        eprintln!("refresh_tasks failed: {err:?}");
+                    match self.refresh_tasks_with_events().await {
+                        Ok(events) => {
+                            for event in events {
+                                println!(
+                                    "Task status changed: [{}] From `{}` -> `{}`",
+                                    event.task.title,
+                                    event.previous_status.map(|s| s.as_str()).unwrap_or("None"),
+                                    event.current_status().as_str(),
+                                );
+
+                                if let Err(err) = handle_task_status_change(self, &workflow, &event).await {
+                                    eprintln!("handle_task_status_change failed: {err:?}");
+                                }
+                            }
+                        }
+                        Err(err) => eprintln!("refresh_tasks_with_events failed: {err:?}"),
                     }
                 }
                 changed = shutdown_rx.changed() => {
                     match changed {
-                        Ok(_) => {
-                            if *shutdown_rx.borrow() {
-                                break;
-                            }
-                        }
-                        Err(_) => {
-                            break;
-                        }
+                        Ok(_) if *shutdown_rx.borrow() => break,
+                        Ok(_) => {}
+                        Err(_) => break,
                     }
                 }
             }

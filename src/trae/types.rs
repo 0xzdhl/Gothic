@@ -1,5 +1,8 @@
+use std::{fmt::Debug, pin::Pin, sync::Arc};
+
 use crate::trae::TraeEditor;
 use anyhow::Error;
+use arboard::Clipboard;
 
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub enum TraeEditorMode {
@@ -18,7 +21,7 @@ pub enum TraeSoloTaskFeedback {
     Bad,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TraeTaskStatus {
     Idle,
     Running,
@@ -27,7 +30,19 @@ pub enum TraeTaskStatus {
     Finished,
 }
 
-#[derive(Debug, Clone)]
+impl TraeTaskStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TraeTaskStatus::Idle => "Idle",
+            TraeTaskStatus::Running => "Running",
+            TraeTaskStatus::Interrupted => "Interrupted",
+            TraeTaskStatus::WaitingForHITL => "WaitingForHITL",
+            TraeTaskStatus::Finished => "Finished",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct TraeTask {
     pub title: String,
     pub status: TraeTaskStatus,
@@ -102,5 +117,143 @@ impl<'a> TraeTaskHandler<'a> {
 
     pub async fn type_content(&self, content: &str) -> Result<(), Error> {
         self.editor.type_content_to_chat_input(content).await
+    }
+
+    pub async fn copy_summary(&self) -> Result<String, Error> {
+        // switch to target task item
+        let _ = self.select().await?;
+
+        let _ = self.editor.copy_task_summary_by_index(self.index()).await?;
+
+        // read summary from clipboard
+        let mut clipboard = Clipboard::new()?;
+
+        let clipboard_text = clipboard.get_text()?;
+
+        Ok(clipboard_text)
+    }
+
+    pub async fn retry_task(&self) -> Result<(), Error> {
+        // switch to target task item
+        let _ = self.select().await?;
+        self.editor.retry_task_by_index(self.index()).await
+    }
+
+    pub async fn feedback(&self, feedback: TraeSoloTaskFeedback) -> Result<(), Error> {
+        // switch to target task item
+        let _ = self.select().await?;
+        self.editor
+            .feedback_task_by_index(self.index(), feedback)
+            .await
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskStatusChangeEvent {
+    pub task: TraeTask,
+    pub previous_status: Option<TraeTaskStatus>,
+}
+
+impl TaskStatusChangeEvent {
+    pub fn current_status(&self) -> TraeTaskStatus {
+        self.task.status
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ActionOp {
+    FocusTask,
+    FocusChatInput,
+    ClearChatInput,
+    TypeText(String),
+    PressEnter,
+    ClickSelector(String),
+    ClickButtonByText(String),
+    WaitForSelector { selector: String, timeout_ms: u64 },
+    SleepMs(u64),
+    Custom(Arc<dyn CustomAction>),
+}
+
+pub struct ActionContext<'a> {
+    pub editor: &'a TraeEditor,
+    pub task: &'a TraeTask,
+    pub event: &'a TaskStatusChangeEvent,
+}
+
+pub type ActionFuture<'a> = Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
+
+pub trait CustomAction: Send + Sync + Debug {
+    fn name(&self) -> &'static str;
+    fn run<'a>(&'a self, ctx: ActionContext<'a>) -> ActionFuture<'a>;
+}
+
+#[derive(Debug, Clone)]
+pub struct ActionChain {
+    pub steps: Vec<ActionOp>,
+}
+
+impl ActionChain {
+    pub fn new() -> Self {
+        Self { steps: Vec::new() }
+    }
+
+    pub fn then(mut self, step: ActionOp) -> Self {
+        self.steps.push(step);
+        self
+    }
+
+    pub fn focus_task(self) -> Self {
+        self.then(ActionOp::FocusTask)
+    }
+
+    pub fn focus_chat_input(self) -> Self {
+        self.then(ActionOp::FocusChatInput)
+    }
+    pub fn clear_chat_input(self) -> Self {
+        self.then(ActionOp::ClearChatInput)
+    }
+    pub fn type_text(self, text: impl Into<String>) -> Self {
+        self.then(ActionOp::TypeText(text.into()))
+    }
+    pub fn press_enter(self) -> Self {
+        self.then(ActionOp::PressEnter)
+    }
+    pub fn click_selector(self, selector: impl Into<String>) -> Self {
+        self.then(ActionOp::ClickSelector(selector.into()))
+    }
+    pub fn click_button_by_text(self, text: impl Into<String>) -> Self {
+        self.then(ActionOp::ClickButtonByText(text.into()))
+    }
+    pub fn wait_for_selector(self, selector: impl Into<String>, timeout_ms: u64) -> Self {
+        self.then(ActionOp::WaitForSelector {
+            selector: selector.into(),
+            timeout_ms,
+        })
+    }
+    pub fn sleep_ms(self, ms: u64) -> Self {
+        self.then(ActionOp::SleepMs(ms))
+    }
+
+    pub fn custom<A: CustomAction + 'static>(mut self, action: A) -> Self {
+        self.steps.push(ActionOp::Custom(Arc::new(action)));
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskWorkflow {
+    pub on_finished: ActionChain,
+    pub on_interrupted: ActionChain,
+    pub on_waiting_for_hitl: ActionChain,
+}
+
+impl TaskWorkflow {
+    pub fn chain_for_status(&self, status: TraeTaskStatus) -> Option<&ActionChain> {
+        match status {
+            TraeTaskStatus::Finished => Some(&self.on_finished),
+            TraeTaskStatus::Interrupted => Some(&self.on_interrupted),
+            TraeTaskStatus::WaitingForHITL => Some(&self.on_waiting_for_hitl),
+            TraeTaskStatus::Idle | TraeTaskStatus::Running => None,
+        }
     }
 }
