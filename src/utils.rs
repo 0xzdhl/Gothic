@@ -7,6 +7,8 @@ use tokio::{
     time::{Duration, Instant, sleep},
 };
 
+use crate::trae::{ActionChain, CustomActionExample, TaskWorkflow, TraeEditor};
+
 pub async fn wait_for_debug_port(
     port: u16,
     timeout: Duration,
@@ -63,4 +65,35 @@ pub fn normalize_executable_path_for_cdp(raw_path: &str) -> Option<String> {
     }
 
     Some(dir.replace('\\', "/"))
+}
+
+pub fn build_task_workflow() -> TaskWorkflow {
+    TaskWorkflow {
+        on_finished: ActionChain::new().focus_task().custom(CustomActionExample),
+
+        on_interrupted: ActionChain::new()
+            .focus_task()
+            .focus_chat_input()
+            .clear_chat_input()
+            .type_text("任务中断了，请说明阻塞点和下一步建议。")
+            .press_enter(),
+
+        on_waiting_for_hitl: ActionChain::new()
+            .focus_task()
+            .wait_for_selector(r#"button[data-testid="hitl-primary-button"]"#, 30_000)
+            .click_selector(r#"button[data-testid="hitl-primary-button"]"#),
+    }
+}
+
+pub async fn quick_task(prompt: &str, editor: &TraeEditor) {
+    let task = editor.create_new_task(prompt.to_string()).await;
+
+    // execute task
+    match task.execute().await {
+        Ok(_) => println!("✅️ Task executed successfully. ({})", prompt),
+        Err(e) => eprintln!("Task execution failed: {e}"),
+    }
+
+    // sleep 1 sec
+    sleep(Duration::from_millis(3000)).await;
 }
