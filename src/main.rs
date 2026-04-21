@@ -165,9 +165,8 @@ fn build_task_workflow() -> TaskWorkflow {
             .focus_task()
             .focus_chat_input()
             .clear_chat_input()
-            .type_text("任务中断了，请说明阻塞点和下一步建议。")
-            .press_enter(),
-
+            .type_text("继续"),
+        // .press_enter(),
         on_waiting_for_hitl: ActionChain::new()
             .focus_task()
             .wait_for_selector(r#"button[data-testid="hitl-primary-button"]"#, 30_000)

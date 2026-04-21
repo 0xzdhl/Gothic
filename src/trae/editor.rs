@@ -8,11 +8,13 @@ use crate::utils::{normalize_executable_path_for_cdp, wait_for_selector};
 use anyhow::{Error, Result};
 use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
 use chromiumoxide::{Browser, Page, cdp::browser_protocol::target::TargetInfo};
-use enigo::{Enigo, Key, Keyboard, Settings};
 use serde::Deserialize;
 use tokio::sync::RwLock;
 use tokio::sync::watch::Receiver;
 use tokio::time::{self, Duration, sleep};
+
+const CHAT_INPUT_SELECTOR: &str =
+    "#agent-chat-view div.chat-input-wrapper div.chat-input-v2-input-box-editable";
 
 #[derive(Debug)]
 pub struct TraeEditor {
@@ -281,7 +283,7 @@ impl TraeEditor {
     pub async fn focus_chat_input(&self) -> Result<(), Error> {
         let chat_input_element = wait_for_selector(
             &self.main_page,
-            "#agent-chat-view div.chat-input-wrapper div.chat-input-v2-input-box-editable",
+            CHAT_INPUT_SELECTOR,
             Duration::from_millis(1000 * 60),
         )
         .await?;
@@ -291,15 +293,55 @@ impl TraeEditor {
         Ok(())
     }
 
+    async fn select_all_chat_input_content(&self) -> Result<bool, Error> {
+        Ok(self
+            .main_page
+            .evaluate(format!(
+                r#"
+        (() => {{
+            const editor = document.querySelector({selector:?});
+            if (!(editor instanceof HTMLElement)) {{
+                return false;
+            }}
+
+            editor.focus();
+
+            const selection = window.getSelection();
+            if (!selection) {{
+                return false;
+            }}
+
+            const range = document.createRange();
+            range.selectNodeContents(editor);
+            selection.removeAllRanges();
+            selection.addRange(range);
+
+            return true;
+        }})()
+        "#,
+                selector = CHAT_INPUT_SELECTOR
+            ))
+            .await?
+            .into_value()?)
+    }
+
     pub async fn clear_chat_input(&self) -> Result<(), Error> {
         self.focus_chat_input().await?;
+        let selected = self.select_all_chat_input_content().await?;
 
-        let mut enigo = Enigo::new(&Settings::default())?;
-        enigo.key(Key::Control, enigo::Direction::Press)?;
-        enigo.key(Key::A, enigo::Direction::Click)?;
-        enigo.key(Key::Control, enigo::Direction::Release)?;
+        if !selected {
+            return Err(Error::msg("Cannot select the Trae chat input content."));
+        }
+
+        let chat_input_element = wait_for_selector(
+            &self.main_page,
+            CHAT_INPUT_SELECTOR,
+            Duration::from_millis(1000 * 60),
+        )
+        .await?;
+
         sleep(Duration::from_millis(100)).await;
-        enigo.key(Key::Backspace, enigo::Direction::Click)?;
+        chat_input_element.press_key("Backspace").await?;
         sleep(Duration::from_millis(200)).await;
 
         Ok(())
