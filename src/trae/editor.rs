@@ -19,7 +19,7 @@ pub struct TraeEditor {
     pub(crate) main_page: Page,
     pub(crate) target: TargetInfo,
     pub(crate) prebuilt_agent: TraeEditorPrebuiltSoloAgent,
-    pub(crate) mode: TraeEditorMode,
+    pub mode: TraeEditorMode,
     pub(crate) tasks: RwLock<Vec<TraeTask>>,
 }
 
@@ -58,22 +58,6 @@ fn parse_task_status(raw_status: &str) -> TraeTaskStatus {
         TRAE_SOLO_TASK_FINISHED_LABEL => TraeTaskStatus::Finished,
         TRAE_SOLO_TASK_WAITING_FOR_HITL_LABEL => TraeTaskStatus::WaitingForHITL,
         _ => TraeTaskStatus::Idle,
-    }
-}
-
-fn build_task_key(task_id: Option<&str>, title: &str, ordinal: usize) -> String {
-    if let Some(task_id) = task_id {
-        let task_id = task_id.trim();
-        if !task_id.is_empty() {
-            return format!("id:{task_id}");
-        }
-    }
-
-    let title = title.trim();
-    if title.is_empty() {
-        format!("title:__empty__#{ordinal}")
-    } else {
-        format!("title:{title}#{ordinal}")
     }
 }
 
@@ -245,6 +229,49 @@ impl TraeEditor {
         Ok(events)
     }
 
+    async fn bootstrap_tasks_with_events(
+        &self,
+        policy: InitialTaskPolicy,
+    ) -> Result<Vec<TaskStatusChangeEvent>, Error> {
+        let latest = self.fetch_tasks_from_ui().await?;
+
+        let events = latest
+            .iter()
+            .filter(|task| policy.should_emit(task.status))
+            .cloned()
+            .map(|task| TaskStatusChangeEvent {
+                task,
+                previous_status: None,
+            })
+            .collect::<Vec<_>>();
+
+        let mut guard = self.tasks.write().await;
+        *guard = latest;
+        Ok(events)
+    }
+
+    async fn dispatch_task_events(
+        &self,
+        workflow: &TaskWorkflow,
+        events: Vec<TaskStatusChangeEvent>,
+    ) {
+        for event in events {
+            println!(
+                "Task event: [{}] {} -> {}",
+                event.task.title,
+                event
+                    .previous_status
+                    .map(|s| s.as_str())
+                    .unwrap_or("Initial"),
+                event.current_status().as_str(),
+            );
+
+            if let Err(err) = handle_task_status_change(self, workflow, &event).await {
+                eprintln!("handle_task_status_change failed: {err:?}")
+            }
+        }
+    }
+
     pub async fn focus_task_by_index(&self, index: usize) -> Result<(), Error> {
         self.select_task_by_index(index).await?;
         sleep(Duration::from_millis(300)).await;
@@ -283,13 +310,6 @@ impl TraeEditor {
             .execute(InsertTextParams::new(content))
             .await?;
         sleep(Duration::from_millis(100)).await;
-        Ok(())
-    }
-
-    pub async fn press_enter(&self) -> Result<(), Error> {
-        let mut enigo = Enigo::new(&Settings::default())?;
-        enigo.key(Key::Return, enigo::Direction::Click)?;
-        sleep(Duration::from_millis(200)).await;
         Ok(())
     }
 
@@ -356,6 +376,32 @@ impl TraeEditor {
         *guard = latest.clone();
 
         Ok(latest)
+    }
+
+    pub async fn terminate_task_by_index(&self, index: usize) -> Result<(), Error> {
+        let task = self.get_task_by_index(index).await?;
+        match task.status {
+            TraeTaskStatus::Running | TraeTaskStatus::WaitingForHITL => {
+                self.click_element_by_selector("button[class*=chat-input-v2-send-button]")
+                    .await
+            }
+            _ => Err(Error::msg(
+                "You cannot terminate this task as it's not started yet.",
+            )),
+        }
+    }
+
+    pub async fn click_send_button_by_index(&self, index: usize) -> Result<(), Error> {
+        let task = self.get_task_by_index(index).await?;
+        match task.status {
+            TraeTaskStatus::Finished | TraeTaskStatus::Interrupted | TraeTaskStatus::Idle => {
+                self.click_element_by_selector("button[class*=chat-input-v2-send-button]")
+                    .await
+            }
+            _ => Err(Error::msg(
+                "You cannot click send button as this task is still running. Invoke `terminate` method first.",
+            )),
+        }
     }
 
     async fn get_task_by_index(&self, index: usize) -> Result<TraeTask, Error> {
@@ -512,9 +558,13 @@ impl TraeEditor {
         &self,
         interval: Duration,
         workflow: TaskWorkflow,
+        initial_policy: InitialTaskPolicy,
         mut shutdown_rx: Receiver<bool>,
     ) {
-        let _ = self.refresh_tasks().await;
+        match self.bootstrap_tasks_with_events(initial_policy).await {
+            Ok(events) => self.dispatch_task_events(&workflow, events).await,
+            Err(err) => eprintln!("bootstrap_tasks_with_events failed: {err:?}"),
+        }
 
         let mut ticker = time::interval(interval);
         ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -525,18 +575,7 @@ impl TraeEditor {
                 _ = ticker.tick() => {
                     match self.refresh_tasks_with_events().await {
                         Ok(events) => {
-                            for event in events {
-                                println!(
-                                    "Task status changed: [{}] From `{}` -> `{}`",
-                                    event.task.title,
-                                    event.previous_status.map(|s| s.as_str()).unwrap_or("None"),
-                                    event.current_status().as_str(),
-                                );
-
-                                if let Err(err) = handle_task_status_change(self, &workflow, &event).await {
-                                    eprintln!("handle_task_status_change failed: {err:?}");
-                                }
-                            }
+                            self.dispatch_task_events(&workflow, events).await;
                         }
                         Err(err) => eprintln!("refresh_tasks_with_events failed: {err:?}"),
                     }
