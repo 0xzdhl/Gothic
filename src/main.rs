@@ -1,19 +1,16 @@
-use crate::config::Config;
-use crate::trae::{ActionChain, CustomActionExample, TaskWorkflow, TraeEditor, TraeEditorMode};
-use crate::utils::{wait_for_debug_port, wait_for_shutdown};
 use anyhow::Result;
 use chromiumoxide::Browser;
 use futures::StreamExt;
+use gothic::config::Config;
+use gothic::trae::{
+    ActionChain, CustomActionExample, InitialTaskPolicy, TaskWorkflow, TraeEditor, TraeEditorMode,
+};
+use gothic::utils::{wait_for_debug_port, wait_for_shutdown};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::time::{Duration, sleep};
-
-pub mod config;
-pub mod consts;
-pub mod trae;
-pub mod utils;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -87,7 +84,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::spawn(async move {
         arc_editor_for_loop
-            .run_task_sync_loop(Duration::from_secs(2), workflow, shutdown_rx)
+            .run_task_sync_loop(
+                Duration::from_secs(2),
+                workflow,
+                InitialTaskPolicy::EmitTerminalAndWaiting,
+                shutdown_rx,
+            )
             .await;
     });
 
