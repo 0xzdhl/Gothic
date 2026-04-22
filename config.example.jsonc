@@ -1,7 +1,11 @@
 {
 	"$schema": "docs/config-schema.json",
 	"name": "Gothic Configuration",
-
-    // Path to your Trae executable file
-	"trae_executable_path": ""
+	// Path to your Trae executable file
+	"trae_executable_path": "",
+	"command_strategy": "allow",
+	"model": {
+		"api_key": "",
+		"base_url": ""
+	}
 }

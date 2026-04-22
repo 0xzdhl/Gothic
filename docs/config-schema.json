@@ -7,9 +7,38 @@
         "trae_executable_path": {
             "type": "string",
             "description": "The absolute path to Trae executable file."
+        },
+        "command_strategy": {
+            "type": "string",
+            "description": "How the Gothic handles human in the loop command (operation), for example: shell execution.",
+            "enum": [
+                "allow",
+                "deny",
+                "llm"
+            ],
+            "default": "allow"
+        },
+        "model": {
+            "type": "object",
+            "description": "LLM Configuration.",
+            "properties": {
+                "api_key": {
+                    "type": "string",
+                    "description": "OpenAI compatible key."
+                },
+                "base_url": {
+                    "type": "string",
+                    "description": "OpenAi compatible base url."
+                }
+            },
+            "required": [
+                "api_key",
+                "base_url"
+            ]
         }
     },
     "required": [
-        "trae_executable_path"
+        "trae_executable_path",
+        "command_strategy"
     ]
 }
