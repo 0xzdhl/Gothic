@@ -182,6 +182,8 @@ pub enum ActionOp {
     ClickSelector(String),
     ClickButtonByText(String),
     WaitForSelector { selector: String, timeout_ms: u64 },
+    AllowCommand,
+    RejectCommand,
     SleepMs(u64),
     Custom(Arc<dyn CustomAction>),
 }
@@ -244,6 +246,14 @@ impl ActionChain {
     }
     pub fn sleep_ms(self, ms: u64) -> Self {
         self.then(ActionOp::SleepMs(ms))
+    }
+
+    pub fn allow_command(self) -> Self {
+        self.then(ActionOp::AllowCommand)
+    }
+
+    pub fn reject_command(self) -> Self {
+        self.then(ActionOp::RejectCommand)
     }
 
     pub fn custom<A: CustomAction + 'static>(mut self, action: A) -> Self {

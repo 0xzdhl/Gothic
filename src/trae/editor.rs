@@ -420,6 +420,54 @@ impl TraeEditor {
         Ok(latest)
     }
 
+    pub async fn allow_command_by_index(&self, index: usize) -> Result<(), Error> {
+        // select task
+        let _ = self.select_task_by_index(index).await?;
+
+        // get the command str
+        let command_str = wait_for_selector(
+            &self.main_page,
+            "div[class*=icd-run-command-card-v2-command-shell]",
+            Duration::from_millis(DEFAULT_SELECTOR_TIMEOUT),
+        )
+        .await?
+        .inner_text()
+        .await?
+        .unwrap_or_else(|| format!("Cannot get command str at index: {}", index));
+
+        self.click_button_by_text("运行").await?;
+
+        println!("Allowed Command: {}", command_str);
+
+        sleep(Duration::from_millis(500)).await;
+
+        Ok(())
+    }
+
+    pub async fn reject_command_by_index(&self, index: usize) -> Result<(), Error> {
+        // select task
+        let _ = self.select_task_by_index(index).await?;
+
+        // get the command str
+        let command_str = wait_for_selector(
+            &self.main_page,
+            "div[class*=icd-run-command-card-v2-command-shell]",
+            Duration::from_millis(DEFAULT_SELECTOR_TIMEOUT),
+        )
+        .await?
+        .inner_text()
+        .await?
+        .unwrap_or_else(|| format!("Cannot get command str at index: {}", index));
+
+        self.click_button_by_text("跳过").await?;
+
+        println!("Rejected Command: {}", command_str);
+
+        sleep(Duration::from_millis(500)).await;
+
+        Ok(())
+    }
+
     pub async fn terminate_task_by_index(&self, index: usize) -> Result<(), Error> {
         let task = self.get_task_by_index(index).await?;
         match task.status {
