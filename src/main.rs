@@ -165,7 +165,8 @@ fn build_task_workflow() -> TaskWorkflow {
             .focus_task()
             .focus_chat_input()
             .clear_chat_input()
-            .type_text("继续"),
+            .type_text("继续")
+            .press_enter(),
         // .press_enter(),
         on_waiting_for_hitl: ActionChain::new()
             .focus_task()
