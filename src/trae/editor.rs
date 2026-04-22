@@ -6,6 +6,7 @@ use crate::trae::{
 };
 use crate::utils::{normalize_executable_path_for_cdp, wait_for_selector};
 use anyhow::{Error, Result};
+use chromiumoxide::Element;
 use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
 use chromiumoxide::{Browser, Page, cdp::browser_protocol::target::TargetInfo};
 use serde::Deserialize;
@@ -13,8 +14,22 @@ use tokio::sync::RwLock;
 use tokio::sync::watch::Receiver;
 use tokio::time::{self, Duration, sleep};
 
+// TODO: Refactor
 const CHAT_INPUT_SELECTOR: &str =
     "#agent-chat-view div.chat-input-wrapper div.chat-input-v2-input-box-editable";
+
+const COMMAND_CARD_SELECTOR: &str = "div[class*=icd-run-command-card-v2-command-shell],div[class*=icd-delete-files-command-card-v2]";
+const DELETE_COMMAND_CARD_CLASS: &str = "icd-delete-files-command-card-v2";
+const DELETE_COMMAND_TEXT_SELECTOR: &str = "div[class*=icd-delete-files-command-card-v2-cwd]";
+const RUN_COMMAND_TEXT_SELECTOR: &str = "div[class*=icd-run-command-card-v2-command-shell]";
+const DELETE_COMMAND_ALLOW_SELECTOR: &str =
+    "button[class*=icd-delete-files-command-card-v2-actions-delete]";
+const DELETE_COMMAND_REJECT_SELECTOR: &str =
+    "button[class*=icd-delete-files-command-card-v2-actions-cancel]";
+const RUN_COMMAND_ALLOW_SELECTOR: &str = "button[class*=icd-run-command-card-v2-actions-btn-run]";
+const RUN_COMMAND_REJECT_SELECTOR: &str =
+    "button[class*=icd-run-command-card-v2-actions-btn-cancel]";
+const COMMAND_ACTION_TIMEOUT_MS: u64 = 1000 * 30;
 
 #[derive(Debug)]
 pub struct TraeEditor {
@@ -30,6 +45,59 @@ struct TaskSnapshotFromUi {
     title: String,
     raw_status: String,
     selected: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CommandCardKind {
+    Delete,
+    Run,
+}
+
+impl CommandCardKind {
+    fn from_class_name(class_name: &str) -> Self {
+        if class_name.contains(DELETE_COMMAND_CARD_CLASS) {
+            Self::Delete
+        } else {
+            Self::Run
+        }
+    }
+
+    fn raw_command_selector(self) -> &'static str {
+        match self {
+            Self::Delete => DELETE_COMMAND_TEXT_SELECTOR,
+            Self::Run => RUN_COMMAND_TEXT_SELECTOR,
+        }
+    }
+
+    fn action_button_selector(self, decision: CommandDecision) -> &'static str {
+        match (self, decision) {
+            (Self::Delete, CommandDecision::Allow) => DELETE_COMMAND_ALLOW_SELECTOR,
+            (Self::Delete, CommandDecision::Reject) => DELETE_COMMAND_REJECT_SELECTOR,
+            (Self::Run, CommandDecision::Allow) => RUN_COMMAND_ALLOW_SELECTOR,
+            (Self::Run, CommandDecision::Reject) => RUN_COMMAND_REJECT_SELECTOR,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CommandDecision {
+    Allow,
+    Reject,
+}
+
+impl CommandDecision {
+    fn log_label(self) -> &'static str {
+        match self {
+            Self::Allow => "Allowed",
+            Self::Reject => "Rejected",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PendingCommandAction {
+    kind: CommandCardKind,
+    raw_command: String,
 }
 
 pub async fn get_current_editor_mode(page: &Page) -> Result<TraeEditorMode, Error> {
@@ -420,52 +488,91 @@ impl TraeEditor {
         Ok(latest)
     }
 
-    pub async fn allow_command_by_index(&self, index: usize) -> Result<(), Error> {
-        // select task
-        let _ = self.select_task_by_index(index).await?;
+    async fn get_command_card_kind(
+        &self,
+        command_container: &Element,
+    ) -> Result<CommandCardKind, Error> {
+        let element_class = command_container
+            .attribute("class")
+            .await?
+            .unwrap_or_default();
 
-        // get the command str
-        let command_str = wait_for_selector(
+        Ok(CommandCardKind::from_class_name(&element_class))
+    }
+
+    async fn get_raw_command_str(
+        &self,
+        command_kind: CommandCardKind,
+        command_container: &Element,
+        index: usize,
+    ) -> Result<String, Error> {
+        let raw_command = match wait_for_selector(
             &self.main_page,
-            "div[class*=icd-run-command-card-v2-command-shell]",
+            command_kind.raw_command_selector(),
             Duration::from_millis(DEFAULT_SELECTOR_TIMEOUT),
         )
-        .await?
-        .inner_text()
-        .await?
-        .unwrap_or_else(|| format!("Cannot get command str at index: {}", index));
+        .await
+        {
+            Ok(element) => element.inner_text().await?,
+            Err(_) => command_container.inner_text().await?,
+        };
 
-        self.click_button_by_text("运行").await?;
+        Ok(raw_command.unwrap_or_else(|| format!("Cannot get command str at index: {}", index)))
+    }
 
-        println!("Allowed Command: {}", command_str);
+    async fn resolve_pending_command_action(
+        &self,
+        index: usize,
+    ) -> Result<PendingCommandAction, Error> {
+        self.select_task_by_index(index).await?;
+        let command_container = wait_for_selector(
+            &self.main_page,
+            COMMAND_CARD_SELECTOR,
+            Duration::from_millis(DEFAULT_SELECTOR_TIMEOUT),
+        )
+        .await?;
+        let kind = self.get_command_card_kind(&command_container).await?;
+        let raw_command = self
+            .get_raw_command_str(kind, &command_container, index)
+            .await?;
+
+        Ok(PendingCommandAction { kind, raw_command })
+    }
+
+    async fn handle_command_by_index(
+        &self,
+        index: usize,
+        decision: CommandDecision,
+    ) -> Result<(), Error> {
+        let pending_command = self.resolve_pending_command_action(index).await?;
+
+        let action_button = wait_for_selector(
+            &self.main_page,
+            pending_command.kind.action_button_selector(decision),
+            Duration::from_millis(COMMAND_ACTION_TIMEOUT_MS),
+        )
+        .await?;
+        action_button.click().await?;
+
+        println!(
+            "{} Command: {}",
+            decision.log_label(),
+            pending_command.raw_command
+        );
 
         sleep(Duration::from_millis(500)).await;
 
         Ok(())
     }
 
+    pub async fn allow_command_by_index(&self, index: usize) -> Result<(), Error> {
+        self.handle_command_by_index(index, CommandDecision::Allow)
+            .await
+    }
+
     pub async fn reject_command_by_index(&self, index: usize) -> Result<(), Error> {
-        // select task
-        let _ = self.select_task_by_index(index).await?;
-
-        // get the command str
-        let command_str = wait_for_selector(
-            &self.main_page,
-            "div[class*=icd-run-command-card-v2-command-shell]",
-            Duration::from_millis(DEFAULT_SELECTOR_TIMEOUT),
-        )
-        .await?
-        .inner_text()
-        .await?
-        .unwrap_or_else(|| format!("Cannot get command str at index: {}", index));
-
-        self.click_button_by_text("跳过").await?;
-
-        println!("Rejected Command: {}", command_str);
-
-        sleep(Duration::from_millis(500)).await;
-
-        Ok(())
+        self.handle_command_by_index(index, CommandDecision::Reject)
+            .await
     }
 
     pub async fn terminate_task_by_index(&self, index: usize) -> Result<(), Error> {
