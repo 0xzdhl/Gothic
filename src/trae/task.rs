@@ -56,6 +56,9 @@ impl<'a> NewTraeTask<'a> {
 
         chat_input_element.click().await?;
 
+        // clear input first
+        self.editor.clear_chat_input().await?;
+
         self.editor
             .main_page
             .execute(InsertTextParams::new(self.prompt.as_str()))

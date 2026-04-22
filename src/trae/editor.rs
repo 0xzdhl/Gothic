@@ -8,18 +8,20 @@ use crate::utils::{normalize_executable_path_for_cdp, wait_for_selector};
 use anyhow::{Error, Result};
 use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
 use chromiumoxide::{Browser, Page, cdp::browser_protocol::target::TargetInfo};
-use enigo::{Enigo, Key, Keyboard, Settings};
 use serde::Deserialize;
 use tokio::sync::RwLock;
 use tokio::sync::watch::Receiver;
 use tokio::time::{self, Duration, sleep};
+
+const CHAT_INPUT_SELECTOR: &str =
+    "#agent-chat-view div.chat-input-wrapper div.chat-input-v2-input-box-editable";
 
 #[derive(Debug)]
 pub struct TraeEditor {
     pub(crate) main_page: Page,
     pub(crate) target: TargetInfo,
     pub(crate) prebuilt_agent: TraeEditorPrebuiltSoloAgent,
-    pub(crate) mode: TraeEditorMode,
+    pub mode: TraeEditorMode,
     pub(crate) tasks: RwLock<Vec<TraeTask>>,
 }
 
@@ -58,22 +60,6 @@ fn parse_task_status(raw_status: &str) -> TraeTaskStatus {
         TRAE_SOLO_TASK_FINISHED_LABEL => TraeTaskStatus::Finished,
         TRAE_SOLO_TASK_WAITING_FOR_HITL_LABEL => TraeTaskStatus::WaitingForHITL,
         _ => TraeTaskStatus::Idle,
-    }
-}
-
-fn build_task_key(task_id: Option<&str>, title: &str, ordinal: usize) -> String {
-    if let Some(task_id) = task_id {
-        let task_id = task_id.trim();
-        if !task_id.is_empty() {
-            return format!("id:{task_id}");
-        }
-    }
-
-    let title = title.trim();
-    if title.is_empty() {
-        format!("title:__empty__#{ordinal}")
-    } else {
-        format!("title:{title}#{ordinal}")
     }
 }
 
@@ -245,6 +231,49 @@ impl TraeEditor {
         Ok(events)
     }
 
+    async fn bootstrap_tasks_with_events(
+        &self,
+        policy: InitialTaskPolicy,
+    ) -> Result<Vec<TaskStatusChangeEvent>, Error> {
+        let latest = self.fetch_tasks_from_ui().await?;
+
+        let events = latest
+            .iter()
+            .filter(|task| policy.should_emit(task.status))
+            .cloned()
+            .map(|task| TaskStatusChangeEvent {
+                task,
+                previous_status: None,
+            })
+            .collect::<Vec<_>>();
+
+        let mut guard = self.tasks.write().await;
+        *guard = latest;
+        Ok(events)
+    }
+
+    async fn dispatch_task_events(
+        &self,
+        workflow: &TaskWorkflow,
+        events: Vec<TaskStatusChangeEvent>,
+    ) {
+        for event in events {
+            println!(
+                "Task event: [{}] {} -> {}",
+                event.task.title,
+                event
+                    .previous_status
+                    .map(|s| s.as_str())
+                    .unwrap_or("Initial"),
+                event.current_status().as_str(),
+            );
+
+            if let Err(err) = handle_task_status_change(self, workflow, &event).await {
+                eprintln!("handle_task_status_change failed: {err:?}")
+            }
+        }
+    }
+
     pub async fn focus_task_by_index(&self, index: usize) -> Result<(), Error> {
         self.select_task_by_index(index).await?;
         sleep(Duration::from_millis(300)).await;
@@ -254,7 +283,7 @@ impl TraeEditor {
     pub async fn focus_chat_input(&self) -> Result<(), Error> {
         let chat_input_element = wait_for_selector(
             &self.main_page,
-            "#agent-chat-view div.chat-input-wrapper div.chat-input-v2-input-box-editable",
+            CHAT_INPUT_SELECTOR,
             Duration::from_millis(1000 * 60),
         )
         .await?;
@@ -264,15 +293,55 @@ impl TraeEditor {
         Ok(())
     }
 
+    async fn select_all_chat_input_content(&self) -> Result<bool, Error> {
+        Ok(self
+            .main_page
+            .evaluate(format!(
+                r#"
+        (() => {{
+            const editor = document.querySelector({selector:?});
+            if (!(editor instanceof HTMLElement)) {{
+                return false;
+            }}
+
+            editor.focus();
+
+            const selection = window.getSelection();
+            if (!selection) {{
+                return false;
+            }}
+
+            const range = document.createRange();
+            range.selectNodeContents(editor);
+            selection.removeAllRanges();
+            selection.addRange(range);
+
+            return true;
+        }})()
+        "#,
+                selector = CHAT_INPUT_SELECTOR
+            ))
+            .await?
+            .into_value()?)
+    }
+
     pub async fn clear_chat_input(&self) -> Result<(), Error> {
         self.focus_chat_input().await?;
+        let selected = self.select_all_chat_input_content().await?;
 
-        let mut enigo = Enigo::new(&Settings::default())?;
-        enigo.key(Key::Control, enigo::Direction::Press)?;
-        enigo.key(Key::A, enigo::Direction::Click)?;
-        enigo.key(Key::Control, enigo::Direction::Release)?;
+        if !selected {
+            return Err(Error::msg("Cannot select the Trae chat input content."));
+        }
+
+        let chat_input_element = wait_for_selector(
+            &self.main_page,
+            CHAT_INPUT_SELECTOR,
+            Duration::from_millis(1000 * 60),
+        )
+        .await?;
+
         sleep(Duration::from_millis(100)).await;
-        enigo.key(Key::Backspace, enigo::Direction::Click)?;
+        chat_input_element.press_key("Backspace").await?;
         sleep(Duration::from_millis(200)).await;
 
         Ok(())
@@ -283,13 +352,6 @@ impl TraeEditor {
             .execute(InsertTextParams::new(content))
             .await?;
         sleep(Duration::from_millis(100)).await;
-        Ok(())
-    }
-
-    pub async fn press_enter(&self) -> Result<(), Error> {
-        let mut enigo = Enigo::new(&Settings::default())?;
-        enigo.key(Key::Return, enigo::Direction::Click)?;
-        sleep(Duration::from_millis(200)).await;
         Ok(())
     }
 
@@ -356,6 +418,80 @@ impl TraeEditor {
         *guard = latest.clone();
 
         Ok(latest)
+    }
+
+    pub async fn allow_command_by_index(&self, index: usize) -> Result<(), Error> {
+        // select task
+        let _ = self.select_task_by_index(index).await?;
+
+        // get the command str
+        let command_str = wait_for_selector(
+            &self.main_page,
+            "div[class*=icd-run-command-card-v2-command-shell]",
+            Duration::from_millis(DEFAULT_SELECTOR_TIMEOUT),
+        )
+        .await?
+        .inner_text()
+        .await?
+        .unwrap_or_else(|| format!("Cannot get command str at index: {}", index));
+
+        self.click_button_by_text("运行").await?;
+
+        println!("Allowed Command: {}", command_str);
+
+        sleep(Duration::from_millis(500)).await;
+
+        Ok(())
+    }
+
+    pub async fn reject_command_by_index(&self, index: usize) -> Result<(), Error> {
+        // select task
+        let _ = self.select_task_by_index(index).await?;
+
+        // get the command str
+        let command_str = wait_for_selector(
+            &self.main_page,
+            "div[class*=icd-run-command-card-v2-command-shell]",
+            Duration::from_millis(DEFAULT_SELECTOR_TIMEOUT),
+        )
+        .await?
+        .inner_text()
+        .await?
+        .unwrap_or_else(|| format!("Cannot get command str at index: {}", index));
+
+        self.click_button_by_text("跳过").await?;
+
+        println!("Rejected Command: {}", command_str);
+
+        sleep(Duration::from_millis(500)).await;
+
+        Ok(())
+    }
+
+    pub async fn terminate_task_by_index(&self, index: usize) -> Result<(), Error> {
+        let task = self.get_task_by_index(index).await?;
+        match task.status {
+            TraeTaskStatus::Running | TraeTaskStatus::WaitingForHITL => {
+                self.click_element_by_selector("button[class*=chat-input-v2-send-button]")
+                    .await
+            }
+            _ => Err(Error::msg(
+                "You cannot terminate this task as it's not started yet.",
+            )),
+        }
+    }
+
+    pub async fn click_send_button_by_index(&self, index: usize) -> Result<(), Error> {
+        let task = self.get_task_by_index(index).await?;
+        match task.status {
+            TraeTaskStatus::Finished | TraeTaskStatus::Interrupted | TraeTaskStatus::Idle => {
+                self.click_element_by_selector("button[class*=chat-input-v2-send-button]")
+                    .await
+            }
+            _ => Err(Error::msg(
+                "You cannot click send button as this task is still running. Invoke `terminate` method first.",
+            )),
+        }
     }
 
     async fn get_task_by_index(&self, index: usize) -> Result<TraeTask, Error> {
@@ -512,9 +648,13 @@ impl TraeEditor {
         &self,
         interval: Duration,
         workflow: TaskWorkflow,
+        initial_policy: InitialTaskPolicy,
         mut shutdown_rx: Receiver<bool>,
     ) {
-        let _ = self.refresh_tasks().await;
+        match self.bootstrap_tasks_with_events(initial_policy).await {
+            Ok(events) => self.dispatch_task_events(&workflow, events).await,
+            Err(err) => eprintln!("bootstrap_tasks_with_events failed: {err:?}"),
+        }
 
         let mut ticker = time::interval(interval);
         ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -525,18 +665,7 @@ impl TraeEditor {
                 _ = ticker.tick() => {
                     match self.refresh_tasks_with_events().await {
                         Ok(events) => {
-                            for event in events {
-                                println!(
-                                    "Task status changed: [{}] From `{}` -> `{}`",
-                                    event.task.title,
-                                    event.previous_status.map(|s| s.as_str()).unwrap_or("None"),
-                                    event.current_status().as_str(),
-                                );
-
-                                if let Err(err) = handle_task_status_change(self, &workflow, &event).await {
-                                    eprintln!("handle_task_status_change failed: {err:?}");
-                                }
-                            }
+                            self.dispatch_task_events(&workflow, events).await;
                         }
                         Err(err) => eprintln!("refresh_tasks_with_events failed: {err:?}"),
                     }

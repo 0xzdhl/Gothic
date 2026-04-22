@@ -146,6 +146,18 @@ impl<'a> TraeTaskHandler<'a> {
             .feedback_task_by_index(self.index(), feedback)
             .await
     }
+
+    pub async fn terminate(&self) -> Result<(), Error> {
+        let _ = self.select().await?;
+
+        self.editor.terminate_task_by_index(self.index()).await
+    }
+
+    pub async fn trigger_send(&self) -> Result<(), Error> {
+        let _ = self.select().await?;
+
+        self.editor.click_send_button_by_index(self.index()).await
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -170,6 +182,8 @@ pub enum ActionOp {
     ClickSelector(String),
     ClickButtonByText(String),
     WaitForSelector { selector: String, timeout_ms: u64 },
+    AllowCommand,
+    RejectCommand,
     SleepMs(u64),
     Custom(Arc<dyn CustomAction>),
 }
@@ -234,6 +248,14 @@ impl ActionChain {
         self.then(ActionOp::SleepMs(ms))
     }
 
+    pub fn allow_command(self) -> Self {
+        self.then(ActionOp::AllowCommand)
+    }
+
+    pub fn reject_command(self) -> Self {
+        self.then(ActionOp::RejectCommand)
+    }
+
     pub fn custom<A: CustomAction + 'static>(mut self, action: A) -> Self {
         self.steps.push(ActionOp::Custom(Arc::new(action)));
         self
@@ -254,6 +276,27 @@ impl TaskWorkflow {
             TraeTaskStatus::Interrupted => Some(&self.on_interrupted),
             TraeTaskStatus::WaitingForHITL => Some(&self.on_waiting_for_hitl),
             TraeTaskStatus::Idle | TraeTaskStatus::Running => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum InitialTaskPolicy {
+    Ignore,
+    EmitAll,
+    EmitTerminalAndWaiting,
+}
+
+impl InitialTaskPolicy {
+    pub fn should_emit(&self, status: TraeTaskStatus) -> bool {
+        match self {
+            InitialTaskPolicy::Ignore => false,
+            InitialTaskPolicy::EmitAll => true,
+            InitialTaskPolicy::EmitTerminalAndWaiting => matches!(
+                status,
+                // TraeTaskStatus::Finished
+                |TraeTaskStatus::Interrupted| TraeTaskStatus::WaitingForHITL
+            ),
         }
     }
 }
