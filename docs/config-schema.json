@@ -39,6 +39,11 @@
                 "base_url": {
                     "type": "string",
                     "description": "OpenAI compatible base url."
+                },
+                "model_name": {
+                    "type": "string",
+                    "description": "Model name used when command_strategy or question_strategy is llm.",
+                    "default": "gpt-5-mini"
                 }
             },
             "required": [
@@ -48,7 +53,6 @@
         }
     },
     "required": [
-        "trae_executable_path",
-        "command_strategy"
+        "trae_executable_path"
     ]
 }
