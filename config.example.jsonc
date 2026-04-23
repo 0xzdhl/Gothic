@@ -4,6 +4,7 @@
 	// Path to your Trae executable file
 	"trae_executable_path": "",
 	"command_strategy": "allow",
+	"question_strategy": "auto",
 	"model": {
 		"api_key": "",
 		"base_url": ""

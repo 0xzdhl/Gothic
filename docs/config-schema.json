@@ -18,6 +18,16 @@
             ],
             "default": "allow"
         },
+        "question_strategy": {
+            "type": "string",
+            "description": "How the Gothic handles human in the loop question (operation). \n\n- skip: skip all the questions. \n- auto: select an option randomly.\n- llm: invoke llm to decide.",
+            "enum": [
+                "skip",
+                "auto",
+                "llm"
+            ],
+            "default": "auto"
+        },
         "model": {
             "type": "object",
             "description": "LLM Configuration.",

@@ -20,9 +20,18 @@ pub enum CommandStrategy {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum QuestionStrategy {
+    Skip,
+    Auto,
+    LLM,
+}
+
+#[derive(Deserialize, Debug)]
 pub struct Config {
     pub trae_executable_path: String,
     pub command_strategy: CommandStrategy,
+    pub question_strategy: QuestionStrategy,
     pub model: ModelConfig,
 }
 
