@@ -103,3 +103,36 @@ impl CustomAction for CustomActionExample {
         })
     }
 }
+
+#[derive(Debug)]
+pub struct CommandAction;
+
+impl CustomAction for CommandAction {
+    fn name(&self) -> &'static str {
+        "command_action"
+    }
+
+    fn run<'a>(&'a self, ctx: ActionContext<'a>) -> super::ActionFuture<'a> {
+        // TODO: Question Card
+        Box::pin(async move {
+            let command_strategy = &ctx.editor.config.command_strategy;
+
+            // scene 1: Need interact with command card
+            match command_strategy {
+                crate::config::CommandStrategy::Allow => {
+                    ctx.editor.allow_command_by_index(ctx.task.index).await?
+                }
+                crate::config::CommandStrategy::Deny => {
+                    ctx.editor.reject_command_by_index(ctx.task.index).await?
+                }
+                crate::config::CommandStrategy::LLM => {
+                    todo!("LLM integration has not implemented yet.")
+                }
+            }
+
+            // scene 2: Need interact with question card (single/multiple)
+
+            Ok(())
+        })
+    }
+}
