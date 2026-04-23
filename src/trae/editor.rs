@@ -12,7 +12,7 @@ use chromiumoxide::{Browser, Page, cdp::browser_protocol::target::TargetInfo};
 use serde::Deserialize;
 use tokio::sync::RwLock;
 use tokio::sync::watch::Receiver;
-use tokio::time::{self, Duration, sleep};
+use tokio::time::{self, Duration, Instant, sleep};
 
 // TODO: Refactor
 const CHAT_INPUT_SELECTOR: &str =
@@ -29,7 +29,10 @@ const DELETE_COMMAND_REJECT_SELECTOR: &str =
 const RUN_COMMAND_ALLOW_SELECTOR: &str = "button[class*=icd-run-command-card-v2-actions-btn-run]";
 const RUN_COMMAND_REJECT_SELECTOR: &str =
     "button[class*=icd-run-command-card-v2-actions-btn-cancel]";
+const DELETE_CONFIRM_POPOVER_SELECTOR: &str = "div[class*=confirm-popover-body]";
+const DELETE_CONFIRM_BUTTON_TEXT: &str = "\u{786E}\u{8BA4}";
 const COMMAND_ACTION_TIMEOUT_MS: u64 = 1000 * 30;
+const COMMAND_ACTION_POLL_INTERVAL_MS: u64 = 300;
 
 #[derive(Debug)]
 pub struct TraeEditor {
@@ -38,6 +41,7 @@ pub struct TraeEditor {
     pub(crate) prebuilt_agent: TraeEditorPrebuiltSoloAgent,
     pub mode: TraeEditorMode,
     pub(crate) tasks: RwLock<Vec<TraeTask>>,
+    pub config: Config,
 }
 
 #[derive(Debug, Deserialize)]
@@ -134,12 +138,10 @@ fn parse_task_status(raw_status: &str) -> TraeTaskStatus {
 pub struct TraeEditorBuilder;
 
 impl TraeEditorBuilder {
-    pub async fn build(&self, browser: &mut Browser) -> TraeEditor {
+    pub async fn build(&self, browser: &mut Browser, config: Config) -> TraeEditor {
         let targets = browser.fetch_targets().await.expect("Fetch targets error.");
 
         sleep(Duration::from_millis(2000)).await;
-
-        let config = Config::load().expect("Cannot load config from TraeEditorBuilder::build, make sure you write config.jsonc properly.");
 
         let normalized_path =
             normalize_executable_path_for_cdp(&config.trae_executable_path).unwrap();
@@ -176,6 +178,7 @@ impl TraeEditorBuilder {
             main_page: main_page,
             prebuilt_agent: TraeEditorPrebuiltSoloAgent::Coder,
             mode: current_mode,
+            config,
             tasks: RwLock::new(Vec::new()),
         };
     }
@@ -453,7 +456,7 @@ impl TraeEditor {
             const expectedText = {button_text_literal}.trim();
             const candidates = Array.from(document.querySelectorAll('button, [role="button"]'));
             const target = candidates.find(
-                (node) => (node.innerText ?? '').trim() === expectedText
+                (node) => (node.textContent ?? node.innerText ?? '').trim() === expectedText
             );
 
             if (!target) {{
@@ -477,6 +480,63 @@ impl TraeEditor {
 
         sleep(Duration::from_millis(300)).await;
         Ok(())
+    }
+
+    async fn try_click_button_by_text_in_scope(
+        &self,
+        scope_selector: &str,
+        button_text: &str,
+    ) -> Result<bool, Error> {
+        let scope_selector_literal = format!("{scope_selector:?}");
+        let button_text_literal = format!("{button_text:?}");
+
+        Ok(self
+            .main_page
+            .evaluate(format!(
+                r#"
+        (() => {{
+            const expectedText = {button_text_literal}.trim();
+
+            for (const scope of document.querySelectorAll({scope_selector_literal})) {{
+                const target = Array.from(scope.querySelectorAll('button, [role="button"]')).find(
+                    (node) => (node.textContent ?? node.innerText ?? '').trim() === expectedText
+                );
+
+                if (target) {{
+                    target.click();
+                    return true;
+                }}
+            }}
+
+            return false;
+        }})()
+        "#
+            ))
+            .await?
+            .into_value()?)
+    }
+
+    async fn confirm_delete_command(&self) -> Result<(), Error> {
+        let timeout = Duration::from_millis(COMMAND_ACTION_TIMEOUT_MS);
+        let start = Instant::now();
+
+        while start.elapsed() < timeout {
+            if self
+                .try_click_button_by_text_in_scope(
+                    DELETE_CONFIRM_POPOVER_SELECTOR,
+                    DELETE_CONFIRM_BUTTON_TEXT,
+                )
+                .await?
+            {
+                return Ok(());
+            }
+
+            sleep(Duration::from_millis(COMMAND_ACTION_POLL_INTERVAL_MS)).await;
+        }
+
+        Err(Error::msg(
+            "Cannot find the delete confirmation button from popover.",
+        ))
     }
 
     /// Get latest Trae tasks from UI.
@@ -553,6 +613,14 @@ impl TraeEditor {
         )
         .await?;
         action_button.click().await?;
+
+        // Click confirm button
+        if matches!(
+            (pending_command.kind, decision),
+            (CommandCardKind::Delete, CommandDecision::Allow)
+        ) {
+            self.confirm_delete_command().await?;
+        }
 
         println!(
             "{} Command: {}",

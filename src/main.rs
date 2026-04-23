@@ -3,7 +3,8 @@ use chromiumoxide::Browser;
 use futures::StreamExt;
 use gothic::config::Config;
 use gothic::trae::{
-    ActionChain, CustomActionExample, InitialTaskPolicy, TaskWorkflow, TraeEditor, TraeEditorMode,
+    ActionChain, CommandAction, CustomActionExample, InitialTaskPolicy, TaskWorkflow, TraeEditor,
+    TraeEditorMode,
 };
 use gothic::utils::{wait_for_debug_port, wait_for_shutdown};
 use std::process::Stdio;
@@ -16,7 +17,7 @@ use tokio::time::{Duration, sleep};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
 
-    let mut trae_main = Command::new(config.trae_executable_path)
+    let mut trae_main = Command::new(&config.trae_executable_path)
         .arg("--remote-debugging-port=9222")
         .arg("--no-sandbox")
         .stdout(Stdio::null()) // inherit current stream
@@ -49,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let trae_editor_builder = TraeEditor::new();
 
-    let mut trae_editor = trae_editor_builder.build(&mut browser).await;
+    let mut trae_editor = trae_editor_builder.build(&mut browser, config).await;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -166,11 +167,12 @@ fn build_task_workflow() -> TaskWorkflow {
             .focus_chat_input()
             .clear_chat_input()
             .type_text("继续")
+            .sleep_ms(1000)
             .press_enter(),
         // .press_enter(),
         on_waiting_for_hitl: ActionChain::new()
             .focus_task()
-            .wait_for_selector(r#"button[data-testid="hitl-primary-button"]"#, 30_000)
-            .click_selector(r#"button[data-testid="hitl-primary-button"]"#),
+            .sleep_ms(1000)
+            .custom(CommandAction),
     }
 }
