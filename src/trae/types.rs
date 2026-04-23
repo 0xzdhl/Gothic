@@ -184,6 +184,10 @@ pub enum ActionOp {
     WaitForSelector { selector: String, timeout_ms: u64 },
     AllowCommand,
     RejectCommand,
+    // WaitingForHITL 下的统一动作入口。
+    // 与其让 workflow 预先判断“当前是命令卡还是问题卡”，
+    // 不如把判断逻辑下沉到 editor 里直接看实际 DOM。
+    HandleHumanInLoop,
     SleepMs(u64),
     Custom(Arc<dyn CustomAction>),
 }
@@ -254,6 +258,11 @@ impl ActionChain {
 
     pub fn reject_command(self) -> Self {
         self.then(ActionOp::RejectCommand)
+    }
+
+    // 给 workflow 提供一个更语义化的 builder，避免上层继续直接拼 Allow/RejectCommand。
+    pub fn handle_human_in_loop(self) -> Self {
+        self.then(ActionOp::HandleHumanInLoop)
     }
 
     pub fn custom<A: CustomAction + 'static>(mut self, action: A) -> Self {
