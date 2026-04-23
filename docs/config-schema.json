@@ -28,7 +28,7 @@
                 },
                 "base_url": {
                     "type": "string",
-                    "description": "OpenAi compatible base url."
+                    "description": "OpenAI compatible base url."
                 }
             },
             "required": [

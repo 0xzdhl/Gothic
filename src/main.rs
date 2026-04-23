@@ -169,7 +169,7 @@ fn build_task_workflow() -> TaskWorkflow {
             .type_text("继续")
             .sleep_ms(1000)
             .press_enter(),
-        // .press_enter(),
+
         on_waiting_for_hitl: ActionChain::new()
             .focus_task()
             .sleep_ms(1000)
