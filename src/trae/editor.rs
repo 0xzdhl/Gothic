@@ -1,15 +1,23 @@
-use crate::config::Config;
+use crate::config::{CommandStrategy, Config, QuestionStrategy};
 use crate::consts::*;
 use crate::trae::{
     NewTraeTask, TraeTask, TraeTaskStatus, diff_task_status_changes, handle_task_status_change,
     types::*,
 };
 use crate::utils::{normalize_executable_path_for_cdp, wait_for_selector};
-use anyhow::{Error, Result};
+use anyhow::{Error, Result, bail};
+use async_openai::{
+    Client,
+    config::OpenAIConfig,
+    types::chat::{
+        ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
+        CreateChatCompletionRequestArgs, ResponseFormat,
+    },
+};
 use chromiumoxide::Element;
 use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
 use chromiumoxide::{Browser, Page, cdp::browser_protocol::target::TargetInfo};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tokio::sync::watch::Receiver;
 use tokio::time::{self, Duration, Instant, sleep};
@@ -33,6 +41,28 @@ const DELETE_CONFIRM_POPOVER_SELECTOR: &str = "div[class*=confirm-popover-body]"
 const DELETE_CONFIRM_BUTTON_TEXT: &str = "\u{786E}\u{8BA4}";
 const COMMAND_ACTION_TIMEOUT_MS: u64 = 1000 * 30;
 const COMMAND_ACTION_POLL_INTERVAL_MS: u64 = 300;
+
+// WaitingForHITL 状态下，Trae 可能弹出两类 UI:
+// 1. 命令卡片: 需要允许/拒绝命令执行
+// 2. 问题卡片: 需要回答若干问题
+// 这里的 selector / timeout 都是为 scene 2 服务的，尽量和 command card 的常量分开，
+// 方便后续 DOM 变更时只维护 questionnaire 这一组。
+const HITL_PROMPT_TIMEOUT_MS: u64 = 1000 * 10;
+const QUESTION_CARD_SELECTOR: &str =
+    "div[class*=ask-user-question-card-container][class*=ask-user-question-card-status-pending]";
+const QUESTION_TITLE_SELECTOR: &str = "div[class*=ask-user-question-content-title-section]";
+const QUESTION_OPTION_CONTENT_SELECTOR: &str = "div[class*=icd-checkbox-item-content]";
+const QUESTION_OPTION_LABEL_SELECTOR: &str = "div[class*=icd-checkbox-item-label]";
+const QUESTION_OPTION_DESCRIPTION_SELECTOR: &str = "div[class*=icd-checkbox-item-description]";
+const QUESTION_ACTION_BAR_SELECTOR: &str = "div[class*=icd-action-bar-right]";
+const QUESTION_CONTEXT_SELECTOR: &str = "div[class*=user-chat-line]";
+const QUESTION_MULTIPLE_CHOICE_SELECTOR: &str = "div[class*=ask-user-multiple-choice-container]";
+const QUESTION_TEXTAREA_SELECTOR: &str =
+    "textarea[class*=ask-user-question-textarea-input-textarea]";
+const QUESTION_CANCEL_BUTTON_TEXT: &str = "\u{53D6}\u{6D88}";
+const QUESTION_MAX_STEPS: usize = 20;
+const QUESTION_TRANSITION_TIMEOUT_MS: u64 = 1000 * 5;
+const QUESTION_TRANSITION_POLL_INTERVAL_MS: u64 = 200;
 
 #[derive(Debug)]
 pub struct TraeEditor {
@@ -102,6 +132,47 @@ impl CommandDecision {
 struct PendingCommandAction {
     kind: CommandCardKind,
     raw_command: String,
+}
+
+/// Human in the loop kind
+/// Command: shell execution, delete files, .etc
+/// Questionnaire: model will ask human a few questions
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HitlPromptKind {
+    Command,
+    Questionnaire,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct QuestionnaireOption {
+    // 给人看的主选项标题，例如“企业官网”“个人作品集”。
+    title: String,
+    // 选项补充描述。部分题目可能为空字符串，但字段保持一致更利于后续 LLM 提示词构造。
+    description: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct Questionnaire {
+    // 问题出现前最近一条对话上下文，用于给 LLM 提供额外语境。
+    context: String,
+    // 当前步骤的问题正文。
+    question: String,
+    // 显式可点选的选项列表；会过滤掉“其他”这类开放式选项。
+    options: Vec<QuestionnaireOption>,
+    // 是否允许多选。
+    is_multiple: bool,
+    // 某些最后一步没有 option，而是 textarea。
+    // 例如“还有什么补充信息吗（可选）”。这类题仍然是合法的 questionnaire，
+    // 不能因为 options 为空就直接判定成提取失败。
+    has_text_input: bool,
+    // textarea 的 placeholder 仅用于日志 / 签名 / 后续扩展文本填写能力。
+    text_input_placeholder: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmQuestionSelection {
+    // LLM 统一返回零基索引，避免依赖中文标题做反查。
+    option_indices: Vec<usize>,
 }
 
 pub async fn get_current_editor_mode(page: &Page) -> Result<TraeEditorMode, Error> {
@@ -641,6 +712,602 @@ impl TraeEditor {
     pub async fn reject_command_by_index(&self, index: usize) -> Result<(), Error> {
         self.handle_command_by_index(index, CommandDecision::Reject)
             .await
+    }
+
+    async fn detect_hitl_prompt_kind(&self) -> Result<Option<HitlPromptKind>, Error> {
+        let question_selector = format!("{QUESTION_CARD_SELECTOR:?}");
+        let command_selector = format!("{COMMAND_CARD_SELECTOR:?}");
+
+        // 这里故意先看 question 再看 command。
+        // WaitingForHITL 本质上是“等人确认”，但具体弹窗类型并不稳定；
+        // 如果默认假设一定是命令卡片，就会在 question 出现时卡死在 selector timeout。
+        let raw_kind: Option<String> = self
+            .main_page
+            .evaluate(format!(
+                r#"
+        (() => {{
+            if (document.querySelector({question_selector})) {{
+                return "question";
+            }}
+
+            if (document.querySelector({command_selector})) {{
+                return "command";
+            }}
+
+            return null;
+        }})()
+        "#
+            ))
+            .await?
+            .into_value()?;
+
+        Ok(match raw_kind.as_deref() {
+            Some("question") => Some(HitlPromptKind::Questionnaire),
+            Some("command") => Some(HitlPromptKind::Command),
+            _ => None,
+        })
+    }
+
+    async fn wait_for_hitl_prompt_kind(&self) -> Result<HitlPromptKind, Error> {
+        let timeout = Duration::from_millis(HITL_PROMPT_TIMEOUT_MS);
+        let start = Instant::now();
+
+        // 某些卡片不是瞬时渲染出来的，这里轮询等待 UI 稳定。
+        while start.elapsed() < timeout {
+            if let Some(kind) = self.detect_hitl_prompt_kind().await? {
+                return Ok(kind);
+            }
+
+            sleep(Duration::from_millis(COMMAND_ACTION_POLL_INTERVAL_MS)).await;
+        }
+
+        Err(Error::msg(
+            "Cannot find a pending HITL command card or question card.",
+        ))
+    }
+
+    async fn handle_configured_command_by_index(&self, index: usize) -> Result<(), Error> {
+        match self.config.command_strategy {
+            CommandStrategy::Allow => self.allow_command_by_index(index).await,
+            CommandStrategy::Deny => self.reject_command_by_index(index).await,
+            // command 的 LLM 决策还没做，这里明确报错，避免配置成 llm 后静默失败。
+            CommandStrategy::LLM => Err(Error::msg(
+                "command_strategy = \"llm\" is not implemented yet. Use \"allow\" or \"deny\".",
+            )),
+        }
+    }
+
+    /// WaitingForHITL 的统一入口。
+    ///
+    /// workflow 不需要知道当前卡片是 command 还是 questionnaire，
+    /// 只需要在该状态调用这个方法，由这里根据页面实际 DOM 做二次分发。
+    pub async fn handle_human_in_loop_by_index(&self, index: usize) -> Result<(), Error> {
+        self.select_task_by_index(index).await?;
+
+        match self.wait_for_hitl_prompt_kind().await? {
+            HitlPromptKind::Command => self.handle_configured_command_by_index(index).await,
+            HitlPromptKind::Questionnaire => self.answer_questionnaire_by_index(index).await,
+        }
+    }
+
+    async fn extract_questionnaire(&self) -> Result<Option<Questionnaire>, Error> {
+        let card_selector = format!("{QUESTION_CARD_SELECTOR:?}");
+        let title_selector = format!("{QUESTION_TITLE_SELECTOR:?}");
+        let option_content_selector = format!("{QUESTION_OPTION_CONTENT_SELECTOR:?}");
+        let option_label_selector = format!("{QUESTION_OPTION_LABEL_SELECTOR:?}");
+        let option_description_selector = format!("{QUESTION_OPTION_DESCRIPTION_SELECTOR:?}");
+        let context_selector = format!("{QUESTION_CONTEXT_SELECTOR:?}");
+        let multiple_choice_selector = format!("{QUESTION_MULTIPLE_CHOICE_SELECTOR:?}");
+        let textarea_selector = format!("{QUESTION_TEXTAREA_SELECTOR:?}");
+
+        Ok(self
+            .main_page
+            .evaluate(format!(
+                r#"
+        (() => {{
+            // 只读取当前 pending 的 question card，避免误把历史已完成卡片当成当前问题。
+            const card = document.querySelector({card_selector});
+            if (!(card instanceof HTMLElement)) {{
+                return null;
+            }}
+
+            const questionTitle = card.querySelector({title_selector});
+            const questionText = (questionTitle?.innerText ?? questionTitle?.textContent ?? '').trim();
+            if (!questionText) {{
+                return null;
+            }}
+
+            const textInput = card.querySelector({textarea_selector});
+            const hasTextInput = textInput instanceof HTMLTextAreaElement;
+            const textInputPlaceholder = hasTextInput
+                ? (textInput.getAttribute('placeholder') ?? '').trim()
+                : null;
+
+            // 这里只保留“明确可选”的 option：
+            // - 过滤 `is-others`
+            // - 过滤标题为“其他”
+            // 原因是 auto / llm 两种策略都只适合在离散选项中做选择，
+            // 开放式“其他”需要额外文本输入能力，不应混进普通 option 流程里。
+            const options = Array.from(card.querySelectorAll({option_content_selector}))
+                .flatMap((item) => {{
+                    const container = item.closest('div[class*="icd-checkbox-item-container"]');
+                    if ((container?.className ?? '').toString().includes('is-others')) {{
+                        return [];
+                    }}
+
+                    const title = item.querySelector({option_label_selector});
+                    const titleText = (title?.innerText ?? title?.textContent ?? '').trim();
+                    if (!titleText || titleText === '其他') {{
+                        return [];
+                    }}
+
+                    const description = item.querySelector({option_description_selector});
+                    const descriptionText = (description?.innerText ?? description?.textContent ?? '').trim();
+
+                    return [{{
+                        title: titleText,
+                        description: descriptionText,
+                    }}];
+                }});
+
+            // question card 合法的两种形态：
+            // 1. 有 options
+            // 2. 没有 options，但有 textarea
+            // 如果两者都没有，说明 selector 命中了错误区域，直接返回 null。
+            if (options.length === 0 && !hasTextInput) {{
+                return null;
+            }}
+
+            const contextElements = Array.from(document.querySelectorAll({context_selector}));
+            const latestContext = contextElements.at(-1);
+            const context = (latestContext?.innerText ?? latestContext?.textContent ?? '').trim();
+            const isMultiple = !!card.querySelector({multiple_choice_selector});
+
+            return {{
+                context,
+                question: questionText,
+                options,
+                is_multiple: isMultiple,
+                has_text_input: hasTextInput,
+                text_input_placeholder: textInputPlaceholder,
+            }};
+        }})()
+        "#
+            ))
+            .await?
+            .into_value()?)
+    }
+
+    /// 生成“当前步骤签名”，用于判断点击“下一步/提交”后页面是否真的推进。
+    ///
+    /// 不能只看 question 文本，因为不同步骤有机会出现相同标题；
+    /// 也不能只看 options，因为最后一步 textarea 题没有 options。
+    /// 所以这里把 question / option titles / textarea 信息一起编码进签名。
+    fn questionnaire_signature(question: &Questionnaire) -> String {
+        let option_titles = question
+            .options
+            .iter()
+            .map(|option| option.title.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(
+            "{}\n{}\n{}\n{}",
+            question.question,
+            option_titles,
+            question.has_text_input,
+            question
+                .text_input_placeholder
+                .as_deref()
+                .unwrap_or_default()
+        )
+    }
+
+    fn normalize_question_selection(
+        question: &Questionnaire,
+        mut indices: Vec<usize>,
+    ) -> Result<Vec<usize>, Error> {
+        // 对 LLM / 其他上游返回做兜底清洗：
+        // - 去掉越界索引
+        // - 排序去重
+        // - 单选题强制截断成 1 个答案
+        indices.retain(|index| *index < question.options.len());
+        indices.sort_unstable();
+        indices.dedup();
+
+        if indices.is_empty() {
+            bail!(
+                "No valid option index was selected for question: {}",
+                question.question
+            );
+        }
+
+        if !question.is_multiple && indices.len() > 1 {
+            indices.truncate(1);
+        }
+
+        Ok(indices)
+    }
+
+    fn choose_random_question_option(&self, question: &Questionnaire) -> Result<Vec<usize>, Error> {
+        if question.options.is_empty() {
+            bail!("Cannot auto-answer a question without options.");
+        }
+
+        // auto 模式目前保持最简单语义：单步随机取 1 个有效选项。
+        // 即使题目支持多选，这里也先只给 1 个答案，降低误选风险。
+        Ok(vec![rand::random_range(0..question.options.len())])
+    }
+
+    // 构建 OpenAI-compatible client。
+    // 留空时退回 async-openai 默认环境变量行为，便于本地调试。
+    fn build_llm_client(&self) -> Client<OpenAIConfig> {
+        let mut openai_config = OpenAIConfig::new();
+        let model_config = &self.config.model;
+
+        if !model_config.api_key.trim().is_empty() {
+            openai_config = openai_config.with_api_key(model_config.api_key.trim());
+        }
+
+        if !model_config.base_url.trim().is_empty() {
+            openai_config = openai_config.with_api_base(model_config.base_url.trim());
+        }
+
+        Client::with_config(openai_config)
+    }
+
+    /// 给 LLM 的 question 输入。
+    ///
+    /// 这里不直接把 Rust struct debug 输出丢给模型，而是整理成稳定 JSON：
+    /// - 字段顺序稳定，便于排查
+    /// - option 明确带 index，减少模型“按标题猜测”的歧义
+    /// - 后续如果要支持 textarea 自动补全，也可以在这里扩 schema
+    fn build_question_llm_prompt(question: &Questionnaire) -> Result<String, Error> {
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "task_context": question.context,
+            "question": question.question,
+            "is_multiple": question.is_multiple,
+            "options": question
+                .options
+                .iter()
+                .enumerate()
+                .map(|(index, option)| {
+                    serde_json::json!({
+                        "index": index,
+                        "title": option.title,
+                        "description": option.description,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            "response_schema": {
+                "option_indices": "array of zero-based option indexes to choose"
+            }
+        }))?)
+    }
+
+    /// 兼容两种常见输出：
+    /// 1. 纯 JSON
+    /// 2. ```json fenced code block
+    /// 这样可以避免模型偶尔套一层 markdown 时直接解析失败。
+    fn parse_llm_question_selection(content: &str) -> Result<LlmQuestionSelection, Error> {
+        let trimmed = content.trim();
+
+        if let Ok(selection) = serde_json::from_str(trimmed) {
+            return Ok(selection);
+        }
+
+        let fenced = trimmed
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+
+        Ok(serde_json::from_str(fenced)?)
+    }
+
+    async fn choose_question_options_with_llm(
+        &self,
+        question: &Questionnaire,
+    ) -> Result<Vec<usize>, Error> {
+        // 目前 LLM 分支只处理离散选项题。
+        // textarea 题先走“留空提交”的兜底路径，避免模型输出自由文本却没有填入 UI。
+        let model_name = self.config.model.model_name.trim();
+        if model_name.is_empty() {
+            bail!("model.model_name cannot be empty when question_strategy = \"llm\".");
+        }
+
+        let request = CreateChatCompletionRequestArgs::default()
+            .model(model_name)
+            .messages([
+                ChatCompletionRequestSystemMessageArgs::default()
+                    .content(
+                        "You answer IDE assistant questionnaire cards. Return only JSON in the shape {\"option_indices\":[0]}. Use zero-based option indexes from the provided options. For single-choice questions, return exactly one index. Never invent options.",
+                    )
+                    .build()?
+                    .into(),
+                ChatCompletionRequestUserMessageArgs::default()
+                    .content(Self::build_question_llm_prompt(question)?)
+                    .build()?
+                    .into(),
+            ])
+            .response_format(ResponseFormat::JsonObject)
+            .temperature(0.0_f32)
+            .max_completion_tokens(128_u32)
+            .build()?;
+
+        let response = self.build_llm_client().chat().create(request).await?;
+        let content = response
+            .choices
+            .first()
+            .and_then(|choice| choice.message.content.as_deref())
+            .ok_or_else(|| Error::msg("LLM did not return a text answer for the question."))?;
+        let selection = Self::parse_llm_question_selection(content)?;
+
+        Self::normalize_question_selection(question, selection.option_indices)
+    }
+
+    // 根据配置把 question 路由到 skip / auto / llm。
+    async fn choose_question_option_indices(
+        &self,
+        question: &Questionnaire,
+    ) -> Result<Vec<usize>, Error> {
+        match self.config.question_strategy {
+            QuestionStrategy::Skip => Ok(Vec::new()),
+            QuestionStrategy::Auto => self.choose_random_question_option(question),
+            QuestionStrategy::LLM => self.choose_question_options_with_llm(question).await,
+        }
+    }
+
+    async fn click_question_cancel_action(&self) -> Result<bool, Error> {
+        let card_selector = format!("{QUESTION_CARD_SELECTOR:?}");
+        let action_bar_selector = format!("{QUESTION_ACTION_BAR_SELECTOR:?}");
+        let cancel_text = format!("{QUESTION_CANCEL_BUTTON_TEXT:?}");
+
+        // 先按文本匹配“取消”，匹配不到再退回次级按钮 class。
+        // 这样既能抗一点文案波动，又尽量避免误点主按钮。
+        Ok(self
+            .main_page
+            .evaluate(format!(
+                r#"
+        (() => {{
+            const card = document.querySelector({card_selector});
+            const actionBar = card?.querySelector({action_bar_selector});
+            if (!(actionBar instanceof HTMLElement)) {{
+                return false;
+            }}
+
+            const buttons = Array.from(actionBar.querySelectorAll('button'));
+            const target = buttons.find((button) => {{
+                const text = (button.textContent ?? button.innerText ?? '').trim();
+                return text === {cancel_text};
+            }}) ?? buttons.find((button) => (button.className ?? '').toString().includes('icd-btn-secondary'));
+
+            if (!(target instanceof HTMLElement)) {{
+                return false;
+            }}
+
+            target.click();
+            return true;
+        }})()
+        "#
+            ))
+            .await?
+            .into_value()?)
+    }
+
+    async fn click_question_option_by_index(&self, index: usize) -> Result<(), Error> {
+        let card_selector = format!("{QUESTION_CARD_SELECTOR:?}");
+        let option_content_selector = format!("{QUESTION_OPTION_CONTENT_SELECTOR:?}");
+        let option_label_selector = format!("{QUESTION_OPTION_LABEL_SELECTOR:?}");
+        let index_literal = index;
+
+        // 这里按“过滤后的 option 顺序”点击，而不是按按钮文本点击。
+        // 原因是这些选项本质上不是 button，直接按文本搜 button 往往点不中。
+        let clicked: bool = self
+            .main_page
+            .evaluate(format!(
+                r#"
+        (() => {{
+            const card = document.querySelector({card_selector});
+            if (!(card instanceof HTMLElement)) {{
+                return false;
+            }}
+
+            const options = Array.from(card.querySelectorAll({option_content_selector}))
+                .filter((item) => {{
+                    const container = item.closest('div[class*="icd-checkbox-item-container"]');
+                    if ((container?.className ?? '').toString().includes('is-others')) {{
+                        return false;
+                    }}
+
+                    const title = item.querySelector({option_label_selector});
+                    const titleText = (title?.innerText ?? title?.textContent ?? '').trim();
+                    return !!titleText && titleText !== '其他';
+                }});
+
+            const target = options[{index_literal}];
+            if (!(target instanceof HTMLElement)) {{
+                return false;
+            }}
+
+            const clickable = target.closest('div[class*="icd-checkbox-item-container"]') ?? target;
+            if (!(clickable instanceof HTMLElement)) {{
+                return false;
+            }}
+
+            clickable.click();
+            return true;
+        }})()
+        "#
+            ))
+            .await?
+            .into_value()?;
+
+        if !clicked {
+            bail!("Cannot click question option by index: {}", index);
+        }
+
+        sleep(Duration::from_millis(100)).await;
+        Ok(())
+    }
+
+    /// Click 'Next' and 'Submit' button
+    async fn click_question_primary_action(&self) -> Result<bool, Error> {
+        let card_selector = format!("{QUESTION_CARD_SELECTOR:?}");
+        let action_bar_selector = format!("{QUESTION_ACTION_BAR_SELECTOR:?}");
+        let cancel_text = format!("{QUESTION_CANCEL_BUTTON_TEXT:?}");
+
+        // 主按钮在不同步骤里可能叫“下一个”或“提交”。
+        // 这里优先找 primary button；如果 class 变化，再退回“非取消且可点击”的按钮。
+        Ok(self
+            .main_page
+            .evaluate(format!(
+                r#"
+        (() => {{
+            const card = document.querySelector({card_selector});
+            const actionBar = card?.querySelector({action_bar_selector});
+            if (!(actionBar instanceof HTMLElement)) {{
+                return false;
+            }}
+
+            const buttons = Array.from(actionBar.querySelectorAll('button'))
+                .filter((button) => button.getAttribute('aria-disabled') !== 'true' && !button.disabled);
+            const target = buttons.find((button) => (button.className ?? '').toString().includes('icd-btn-primary'))
+                ?? buttons.find((button) => {{
+                    const text = (button.textContent ?? button.innerText ?? '').trim();
+                    return text && text !== {cancel_text};
+                }});
+
+            if (!(target instanceof HTMLElement)) {{
+                return false;
+            }}
+
+            target.click();
+            return true;
+        }})()
+        "#
+            ))
+            .await?
+            .into_value()?)
+    }
+
+    async fn wait_for_question_transition(&self, previous_signature: &str) -> Result<(), Error> {
+        let timeout = Duration::from_millis(QUESTION_TRANSITION_TIMEOUT_MS);
+        let start = Instant::now();
+
+        // 点击后不直接假设成功，而是观察 question 签名是否变化：
+        // - 进入下一题: 签名变化
+        // - 提交完成: 当前卡片消失，extract_questionnaire 返回 None，也算变化
+        // - 页面没动: 持续保持原签名，最终超时
+        while start.elapsed() < timeout {
+            let current = self.extract_questionnaire().await?;
+            let current_signature = current.as_ref().map(Self::questionnaire_signature);
+
+            if current_signature.as_deref() != Some(previous_signature) {
+                return Ok(());
+            }
+
+            sleep(Duration::from_millis(QUESTION_TRANSITION_POLL_INTERVAL_MS)).await;
+        }
+
+        Err(Error::msg(
+            "Questionnaire did not transition after selecting an option.",
+        ))
+    }
+
+    async fn answer_current_questionnaire(&self, question: &Questionnaire) -> Result<(), Error> {
+        if matches!(self.config.question_strategy, QuestionStrategy::Skip) {
+            if !self.click_question_cancel_action().await? {
+                bail!("Cannot find the questionnaire cancel button.");
+            }
+
+            println!("Skipped Question: {}", question.question);
+            sleep(Duration::from_millis(300)).await;
+            return Ok(());
+        }
+
+        // 最后一类 bug 修复：
+        // 某些步骤只有 textarea，没有 options，例如“还有什么补充信息吗（可选）”。
+        // 这类题在 auto / llm 下当前策略都是“留空并直接提交”，
+        // 重点是保证流程继续往后走，而不是因为 options 为空卡死。
+        if question.options.is_empty() && question.has_text_input {
+            sleep(Duration::from_millis(200)).await;
+
+            if !self.click_question_primary_action().await? {
+                bail!("Cannot find the questionnaire primary action button.");
+            }
+
+            println!("Submitted Text Question Empty: {}", question.question);
+
+            return Ok(());
+        }
+
+        // 常规离散选项题：
+        // 1. 算出要点哪些 option
+        // 2. 依次点击
+        // 3. 点击下一步 / 提交
+        let selected_indices = self.choose_question_option_indices(question).await?;
+
+        for index in &selected_indices {
+            self.click_question_option_by_index(*index).await?;
+        }
+
+        sleep(Duration::from_millis(200)).await;
+
+        if !self.click_question_primary_action().await? {
+            bail!("Cannot find the questionnaire primary action button.");
+        }
+
+        let selected_titles = selected_indices
+            .iter()
+            .filter_map(|index| question.options.get(*index))
+            .map(|option| option.title.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        println!(
+            "Answered Question: {} -> {}",
+            question.question, selected_titles
+        );
+
+        Ok(())
+    }
+
+    /// 从当前 pending question card 开始，持续回答直到：
+    /// - card 消失，说明问答流程结束
+    /// - 配置为 skip，点击取消后直接返回
+    /// - 超过最大步数，视为异常保护
+    pub async fn answer_questionnaire_by_index(&self, index: usize) -> Result<(), Error> {
+        self.select_task_by_index(index).await?;
+
+        for step in 0..QUESTION_MAX_STEPS {
+            let Some(question) = self.extract_questionnaire().await? else {
+                // 第 0 步就没拿到 question，说明并没有 question card。
+                if step == 0 {
+                    bail!("Cannot find a pending questionnaire card.");
+                }
+
+                // 已经至少处理过一步，此时卡片消失表示问答完成。
+                return Ok(());
+            };
+
+            let signature = Self::questionnaire_signature(&question);
+            self.answer_current_questionnaire(&question).await?;
+
+            // 给页面一点时间完成切换动画 / DOM 更新，减少立刻检查造成的假阴性。
+            sleep(Duration::from_millis(1000)).await;
+
+            if matches!(self.config.question_strategy, QuestionStrategy::Skip) {
+                return Ok(());
+            }
+
+            self.wait_for_question_transition(&signature).await?;
+        }
+
+        Err(Error::msg(format!(
+            "Questionnaire did not finish within {} steps.",
+            QUESTION_MAX_STEPS
+        )))
     }
 
     pub async fn terminate_task_by_index(&self, index: usize) -> Result<(), Error> {
