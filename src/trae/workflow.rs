@@ -113,11 +113,11 @@ impl CustomAction for CommandAction {
     }
 
     fn run<'a>(&'a self, ctx: ActionContext<'a>) -> super::ActionFuture<'a> {
-
         // TODO: Question Card
         Box::pin(async move {
             let command_strategy = &ctx.editor.config.command_strategy;
 
+            // scene 1: Need interact with command card
             match command_strategy {
                 crate::config::CommandStrategy::Allow => {
                     ctx.editor.allow_command_by_index(ctx.task.index).await?
@@ -129,6 +129,8 @@ impl CustomAction for CommandAction {
                     todo!("LLM integration has not implemented yet.")
                 }
             }
+
+            // scene 2: Need interact with question card (single/multiple)
 
             Ok(())
         })
