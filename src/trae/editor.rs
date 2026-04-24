@@ -1,9 +1,10 @@
 use crate::config::{CommandStrategy, Config, QuestionStrategy};
-use crate::consts::*;
 use crate::trae::{
     NewTraeTask, TraeTask, TraeTaskStatus, diff_task_status_changes, handle_task_status_change,
     types::*,
 };
+
+use crate::trae::consts::*;
 use crate::utils::{normalize_executable_path_for_cdp, wait_for_selector};
 use anyhow::{Error, Result, bail};
 use async_openai::{
@@ -23,46 +24,6 @@ use tokio::sync::watch::Receiver;
 use tokio::time::{self, Duration, Instant, sleep};
 
 // TODO: Refactor
-const CHAT_INPUT_SELECTOR: &str =
-    "#agent-chat-view div.chat-input-wrapper div.chat-input-v2-input-box-editable";
-
-const COMMAND_CARD_SELECTOR: &str = "div[class*=icd-run-command-card-v2-command-shell],div[class*=icd-delete-files-command-card-v2]";
-const DELETE_COMMAND_CARD_CLASS: &str = "icd-delete-files-command-card-v2";
-const DELETE_COMMAND_TEXT_SELECTOR: &str = "div[class*=icd-delete-files-command-card-v2-cwd]";
-const RUN_COMMAND_TEXT_SELECTOR: &str = "div[class*=icd-run-command-card-v2-command-shell]";
-const DELETE_COMMAND_ALLOW_SELECTOR: &str =
-    "button[class*=icd-delete-files-command-card-v2-actions-delete]";
-const DELETE_COMMAND_REJECT_SELECTOR: &str =
-    "button[class*=icd-delete-files-command-card-v2-actions-cancel]";
-const RUN_COMMAND_ALLOW_SELECTOR: &str = "button[class*=icd-run-command-card-v2-actions-btn-run]";
-const RUN_COMMAND_REJECT_SELECTOR: &str =
-    "button[class*=icd-run-command-card-v2-actions-btn-cancel]";
-const DELETE_CONFIRM_POPOVER_SELECTOR: &str = "div[class*=confirm-popover-body]";
-const DELETE_CONFIRM_BUTTON_TEXT: &str = "\u{786E}\u{8BA4}";
-const COMMAND_ACTION_TIMEOUT_MS: u64 = 1000 * 30;
-const COMMAND_ACTION_POLL_INTERVAL_MS: u64 = 300;
-
-// WaitingForHITL 状态下，Trae 可能弹出两类 UI:
-// 1. 命令卡片: 需要允许/拒绝命令执行
-// 2. 问题卡片: 需要回答若干问题
-// 这里的 selector / timeout 都是为 scene 2 服务的，尽量和 command card 的常量分开，
-// 方便后续 DOM 变更时只维护 questionnaire 这一组。
-const HITL_PROMPT_TIMEOUT_MS: u64 = 1000 * 10;
-const QUESTION_CARD_SELECTOR: &str =
-    "div[class*=ask-user-question-card-container][class*=ask-user-question-card-status-pending]";
-const QUESTION_TITLE_SELECTOR: &str = "div[class*=ask-user-question-content-title-section]";
-const QUESTION_OPTION_CONTENT_SELECTOR: &str = "div[class*=icd-checkbox-item-content]";
-const QUESTION_OPTION_LABEL_SELECTOR: &str = "div[class*=icd-checkbox-item-label]";
-const QUESTION_OPTION_DESCRIPTION_SELECTOR: &str = "div[class*=icd-checkbox-item-description]";
-const QUESTION_ACTION_BAR_SELECTOR: &str = "div[class*=icd-action-bar-right]";
-const QUESTION_CONTEXT_SELECTOR: &str = "div[class*=user-chat-line]";
-const QUESTION_MULTIPLE_CHOICE_SELECTOR: &str = "div[class*=ask-user-multiple-choice-container]";
-const QUESTION_TEXTAREA_SELECTOR: &str =
-    "textarea[class*=ask-user-question-textarea-input-textarea]";
-const QUESTION_CANCEL_BUTTON_TEXT: &str = "\u{53D6}\u{6D88}";
-const QUESTION_MAX_STEPS: usize = 20;
-const QUESTION_TRANSITION_TIMEOUT_MS: u64 = 1000 * 5;
-const QUESTION_TRANSITION_POLL_INTERVAL_MS: u64 = 200;
 
 #[derive(Debug)]
 pub struct TraeEditor {
@@ -145,33 +106,23 @@ enum HitlPromptKind {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct QuestionnaireOption {
-    // 给人看的主选项标题，例如“企业官网”“个人作品集”。
     title: String,
-    // 选项补充描述。部分题目可能为空字符串，但字段保持一致更利于后续 LLM 提示词构造。
     description: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct Questionnaire {
-    // 问题出现前最近一条对话上下文，用于给 LLM 提供额外语境。
     context: String,
-    // 当前步骤的问题正文。
     question: String,
-    // 显式可点选的选项列表；会过滤掉“其他”这类开放式选项。
     options: Vec<QuestionnaireOption>,
-    // 是否允许多选。
     is_multiple: bool,
-    // 某些最后一步没有 option，而是 textarea。
-    // 例如“还有什么补充信息吗（可选）”。这类题仍然是合法的 questionnaire，
-    // 不能因为 options 为空就直接判定成提取失败。
+    // if the option contains a textarea
     has_text_input: bool,
-    // textarea 的 placeholder 仅用于日志 / 签名 / 后续扩展文本填写能力。
     text_input_placeholder: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct LlmQuestionSelection {
-    // LLM 统一返回零基索引，避免依赖中文标题做反查。
     option_indices: Vec<usize>,
 }
 
@@ -715,12 +666,10 @@ impl TraeEditor {
     }
 
     async fn detect_hitl_prompt_kind(&self) -> Result<Option<HitlPromptKind>, Error> {
+        // use `:?` to check string literal in debug
         let question_selector = format!("{QUESTION_CARD_SELECTOR:?}");
         let command_selector = format!("{COMMAND_CARD_SELECTOR:?}");
 
-        // 这里故意先看 question 再看 command。
-        // WaitingForHITL 本质上是“等人确认”，但具体弹窗类型并不稳定；
-        // 如果默认假设一定是命令卡片，就会在 question 出现时卡死在 selector timeout。
         let raw_kind: Option<String> = self
             .main_page
             .evaluate(format!(
@@ -749,10 +698,10 @@ impl TraeEditor {
     }
 
     async fn wait_for_hitl_prompt_kind(&self) -> Result<HitlPromptKind, Error> {
-        let timeout = Duration::from_millis(HITL_PROMPT_TIMEOUT_MS);
+        let timeout = Duration::from_millis(HITL_PROMPT_TIMEOUT_MS); // 10 secs
         let start = Instant::now();
 
-        // 某些卡片不是瞬时渲染出来的，这里轮询等待 UI 稳定。
+        // wait until the prompt card to display
         while start.elapsed() < timeout {
             if let Some(kind) = self.detect_hitl_prompt_kind().await? {
                 return Ok(kind);
@@ -770,24 +719,43 @@ impl TraeEditor {
         match self.config.command_strategy {
             CommandStrategy::Allow => self.allow_command_by_index(index).await,
             CommandStrategy::Deny => self.reject_command_by_index(index).await,
-            // command 的 LLM 决策还没做，这里明确报错，避免配置成 llm 后静默失败。
             CommandStrategy::LLM => Err(Error::msg(
                 "command_strategy = \"llm\" is not implemented yet. Use \"allow\" or \"deny\".",
             )),
         }
     }
 
-    /// WaitingForHITL 的统一入口。
-    ///
-    /// workflow 不需要知道当前卡片是 command 还是 questionnaire，
-    /// 只需要在该状态调用这个方法，由这里根据页面实际 DOM 做二次分发。
-    pub async fn handle_human_in_loop_by_index(&self, index: usize) -> Result<(), Error> {
+    async fn answer_questionnaire_by_index(&self, index: usize) -> Result<(), Error> {
         self.select_task_by_index(index).await?;
 
-        match self.wait_for_hitl_prompt_kind().await? {
-            HitlPromptKind::Command => self.handle_configured_command_by_index(index).await,
-            HitlPromptKind::Questionnaire => self.answer_questionnaire_by_index(index).await,
+        // QUESTION_MAX_STEPS is a safety valve for infinite loop
+        for step in 0..QUESTION_MAX_STEPS {
+            let Some(question) = self.extract_questionnaire().await? else {
+                // No question card found, throw an error
+                if step == 0 {
+                    bail!("Cannot find a pending questionnaire card.");
+                }
+
+                return Ok(());
+            };
+
+            let signature = Self::questionnaire_signature(&question);
+            self.answer_current_questionnaire(&question).await?;
+
+            // 给页面一点时间完成切换动画 / DOM 更新，减少立刻检查造成的假阴性。
+            sleep(Duration::from_millis(1000)).await;
+
+            if matches!(self.config.question_strategy, QuestionStrategy::Skip) {
+                return Ok(());
+            }
+
+            self.wait_for_question_transition(&signature).await?;
         }
+
+        Err(Error::msg(format!(
+            "Questionnaire did not finish within {} steps.",
+            QUESTION_MAX_STEPS
+        )))
     }
 
     async fn extract_questionnaire(&self) -> Result<Option<Questionnaire>, Error> {
@@ -805,7 +773,7 @@ impl TraeEditor {
             .evaluate(format!(
                 r#"
         (() => {{
-            // 只读取当前 pending 的 question card，避免误把历史已完成卡片当成当前问题。
+            // only read pending card
             const card = document.querySelector({card_selector});
             if (!(card instanceof HTMLElement)) {{
                 return null;
@@ -823,11 +791,9 @@ impl TraeEditor {
                 ? (textInput.getAttribute('placeholder') ?? '').trim()
                 : null;
 
-            // 这里只保留“明确可选”的 option：
-            // - 过滤 `is-others`
-            // - 过滤标题为“其他”
-            // 原因是 auto / llm 两种策略都只适合在离散选项中做选择，
-            // 开放式“其他”需要额外文本输入能力，不应混进普通 option 流程里。
+            // filter objective options (No input action required)
+            // - exclude `is-others`
+            // - exclude `input`
             const options = Array.from(card.querySelectorAll({option_content_selector}))
                 .flatMap((item) => {{
                     const container = item.closest('div[class*="icd-checkbox-item-container"]');
@@ -850,10 +816,9 @@ impl TraeEditor {
                     }}];
                 }});
 
-            // question card 合法的两种形态：
-            // 1. 有 options
-            // 2. 没有 options，但有 textarea
-            // 如果两者都没有，说明 selector 命中了错误区域，直接返回 null。
+            // A valid question card should be:
+            // 1. options
+            // 2. No options, but got textarea
             if (options.length === 0 && !hasTextInput) {{
                 return null;
             }}
@@ -878,11 +843,20 @@ impl TraeEditor {
             .into_value()?)
     }
 
-    /// 生成“当前步骤签名”，用于判断点击“下一步/提交”后页面是否真的推进。
-    ///
-    /// 不能只看 question 文本，因为不同步骤有机会出现相同标题；
-    /// 也不能只看 options，因为最后一步 textarea 题没有 options。
-    /// 所以这里把 question / option titles / textarea 信息一起编码进签名。
+    /// WaitingForHITL handler
+    pub async fn handle_human_in_loop_by_index(&self, index: usize) -> Result<(), Error> {
+        self.select_task_by_index(index).await?;
+
+        match self.wait_for_hitl_prompt_kind().await? {
+            HitlPromptKind::Command => self.handle_configured_command_by_index(index).await,
+            HitlPromptKind::Questionnaire => self.answer_questionnaire_by_index(index).await,
+        }
+    }
+
+    /// Generate a signature to check if the question is correctly handled
+    /// 1. question title may change sometime
+    /// 2. a question may contains multi options and perhaps a textarea
+    /// 3. encode question, option titles and textarea
     fn questionnaire_signature(question: &Questionnaire) -> String {
         let option_titles = question
             .options
@@ -907,10 +881,6 @@ impl TraeEditor {
         question: &Questionnaire,
         mut indices: Vec<usize>,
     ) -> Result<Vec<usize>, Error> {
-        // 对 LLM / 其他上游返回做兜底清洗：
-        // - 去掉越界索引
-        // - 排序去重
-        // - 单选题强制截断成 1 个答案
         indices.retain(|index| *index < question.options.len());
         indices.sort_unstable();
         indices.dedup();
@@ -934,13 +904,10 @@ impl TraeEditor {
             bail!("Cannot auto-answer a question without options.");
         }
 
-        // auto 模式目前保持最简单语义：单步随机取 1 个有效选项。
-        // 即使题目支持多选，这里也先只给 1 个答案，降低误选风险。
+        // only return an option
         Ok(vec![rand::random_range(0..question.options.len())])
     }
 
-    // 构建 OpenAI-compatible client。
-    // 留空时退回 async-openai 默认环境变量行为，便于本地调试。
     fn build_llm_client(&self) -> Client<OpenAIConfig> {
         let mut openai_config = OpenAIConfig::new();
         let model_config = &self.config.model;
@@ -956,12 +923,6 @@ impl TraeEditor {
         Client::with_config(openai_config)
     }
 
-    /// 给 LLM 的 question 输入。
-    ///
-    /// 这里不直接把 Rust struct debug 输出丢给模型，而是整理成稳定 JSON：
-    /// - 字段顺序稳定，便于排查
-    /// - option 明确带 index，减少模型“按标题猜测”的歧义
-    /// - 后续如果要支持 textarea 自动补全，也可以在这里扩 schema
     fn build_question_llm_prompt(question: &Questionnaire) -> Result<String, Error> {
         Ok(serde_json::to_string_pretty(&serde_json::json!({
             "task_context": question.context,
@@ -985,10 +946,7 @@ impl TraeEditor {
         }))?)
     }
 
-    /// 兼容两种常见输出：
-    /// 1. 纯 JSON
-    /// 2. ```json fenced code block
-    /// 这样可以避免模型偶尔套一层 markdown 时直接解析失败。
+    /// JSON format fence for LLM response
     fn parse_llm_question_selection(content: &str) -> Result<LlmQuestionSelection, Error> {
         let trimmed = content.trim();
 
@@ -1009,8 +967,6 @@ impl TraeEditor {
         &self,
         question: &Questionnaire,
     ) -> Result<Vec<usize>, Error> {
-        // 目前 LLM 分支只处理离散选项题。
-        // textarea 题先走“留空提交”的兜底路径，避免模型输出自由文本却没有填入 UI。
         let model_name = self.config.model.model_name.trim();
         if model_name.is_empty() {
             bail!("model.model_name cannot be empty when question_strategy = \"llm\".");
@@ -1046,11 +1002,11 @@ impl TraeEditor {
         Self::normalize_question_selection(question, selection.option_indices)
     }
 
-    // 根据配置把 question 路由到 skip / auto / llm。
     async fn choose_question_option_indices(
         &self,
         question: &Questionnaire,
     ) -> Result<Vec<usize>, Error> {
+        // decision maker on how to handle QA card
         match self.config.question_strategy {
             QuestionStrategy::Skip => Ok(Vec::new()),
             QuestionStrategy::Auto => self.choose_random_question_option(question),
@@ -1063,8 +1019,6 @@ impl TraeEditor {
         let action_bar_selector = format!("{QUESTION_ACTION_BAR_SELECTOR:?}");
         let cancel_text = format!("{QUESTION_CANCEL_BUTTON_TEXT:?}");
 
-        // 先按文本匹配“取消”，匹配不到再退回次级按钮 class。
-        // 这样既能抗一点文案波动，又尽量避免误点主按钮。
         Ok(self
             .main_page
             .evaluate(format!(
@@ -1099,10 +1053,8 @@ impl TraeEditor {
         let card_selector = format!("{QUESTION_CARD_SELECTOR:?}");
         let option_content_selector = format!("{QUESTION_OPTION_CONTENT_SELECTOR:?}");
         let option_label_selector = format!("{QUESTION_OPTION_LABEL_SELECTOR:?}");
-        let index_literal = index;
 
-        // 这里按“过滤后的 option 顺序”点击，而不是按按钮文本点击。
-        // 原因是这些选项本质上不是 button，直接按文本搜 button 往往点不中。
+        // choose option by its index
         let clicked: bool = self
             .main_page
             .evaluate(format!(
@@ -1125,7 +1077,7 @@ impl TraeEditor {
                     return !!titleText && titleText !== '其他';
                 }});
 
-            const target = options[{index_literal}];
+            const target = options[{index}];
             if (!(target instanceof HTMLElement)) {{
                 return false;
             }}
@@ -1157,8 +1109,6 @@ impl TraeEditor {
         let action_bar_selector = format!("{QUESTION_ACTION_BAR_SELECTOR:?}");
         let cancel_text = format!("{QUESTION_CANCEL_BUTTON_TEXT:?}");
 
-        // 主按钮在不同步骤里可能叫“下一个”或“提交”。
-        // 这里优先找 primary button；如果 class 变化，再退回“非取消且可点击”的按钮。
         Ok(self
             .main_page
             .evaluate(format!(
@@ -1195,10 +1145,10 @@ impl TraeEditor {
         let timeout = Duration::from_millis(QUESTION_TRANSITION_TIMEOUT_MS);
         let start = Instant::now();
 
-        // 点击后不直接假设成功，而是观察 question 签名是否变化：
-        // - 进入下一题: 签名变化
-        // - 提交完成: 当前卡片消失，extract_questionnaire 返回 None，也算变化
-        // - 页面没动: 持续保持原签名，最终超时
+        // Check if the current question finished:
+        // - go to next question: the signature should change
+        // - submit: question card container disappear from page, `extract_questionnaire` return None
+        // - not working: the signature remains the same and timeout
         while start.elapsed() < timeout {
             let current = self.extract_questionnaire().await?;
             let current_signature = current.as_ref().map(Self::questionnaire_signature);
@@ -1226,10 +1176,12 @@ impl TraeEditor {
             return Ok(());
         }
 
-        // 最后一类 bug 修复：
-        // 某些步骤只有 textarea，没有 options，例如“还有什么补充信息吗（可选）”。
-        // 这类题在 auto / llm 下当前策略都是“留空并直接提交”，
-        // 重点是保证流程继续往后走，而不是因为 options 为空卡死。
+        // As some questions may only contain textarea, no options presented. For example:
+        // Any extra info? (Optional).
+        //  __________________________
+        // |__________________________|
+        //
+        // For now we just skip them, because input text in the textarea will lead a lot of work and maybe bugs.
         if question.options.is_empty() && question.has_text_input {
             sleep(Duration::from_millis(200)).await;
 
@@ -1242,10 +1194,10 @@ impl TraeEditor {
             return Ok(());
         }
 
-        // 常规离散选项题：
-        // 1. 算出要点哪些 option
-        // 2. 依次点击
-        // 3. 点击下一步 / 提交
+        // For general QA:
+        // 1. decide which options should we choose
+        // 2. click them sequentially
+        // 3. click `Next` or `Submit`
         let selected_indices = self.choose_question_option_indices(question).await?;
 
         for index in &selected_indices {
@@ -1271,43 +1223,6 @@ impl TraeEditor {
         );
 
         Ok(())
-    }
-
-    /// 从当前 pending question card 开始，持续回答直到：
-    /// - card 消失，说明问答流程结束
-    /// - 配置为 skip，点击取消后直接返回
-    /// - 超过最大步数，视为异常保护
-    pub async fn answer_questionnaire_by_index(&self, index: usize) -> Result<(), Error> {
-        self.select_task_by_index(index).await?;
-
-        for step in 0..QUESTION_MAX_STEPS {
-            let Some(question) = self.extract_questionnaire().await? else {
-                // 第 0 步就没拿到 question，说明并没有 question card。
-                if step == 0 {
-                    bail!("Cannot find a pending questionnaire card.");
-                }
-
-                // 已经至少处理过一步，此时卡片消失表示问答完成。
-                return Ok(());
-            };
-
-            let signature = Self::questionnaire_signature(&question);
-            self.answer_current_questionnaire(&question).await?;
-
-            // 给页面一点时间完成切换动画 / DOM 更新，减少立刻检查造成的假阴性。
-            sleep(Duration::from_millis(1000)).await;
-
-            if matches!(self.config.question_strategy, QuestionStrategy::Skip) {
-                return Ok(());
-            }
-
-            self.wait_for_question_transition(&signature).await?;
-        }
-
-        Err(Error::msg(format!(
-            "Questionnaire did not finish within {} steps.",
-            QUESTION_MAX_STEPS
-        )))
     }
 
     pub async fn terminate_task_by_index(&self, index: usize) -> Result<(), Error> {
