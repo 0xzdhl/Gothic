@@ -112,16 +112,20 @@ impl<'a> TraeTaskHandler<'a> {
     }
 
     pub async fn select(&self) -> Result<(), Error> {
+        let _ui_guard = self.editor.acquire_ui_lock().await;
         self.editor.select_task_by_index(self.index()).await
     }
 
     pub async fn type_content(&self, content: &str) -> Result<(), Error> {
+        let _ui_guard = self.editor.acquire_ui_lock().await;
+        let _ = self.editor.select_task_by_index(self.index()).await?;
         self.editor.type_content_to_chat_input(content).await
     }
 
     pub async fn copy_summary(&self) -> Result<String, Error> {
+        let _ui_guard = self.editor.acquire_ui_lock().await;
         // switch to target task item
-        let _ = self.select().await?;
+        let _ = self.editor.select_task_by_index(self.index()).await?;
 
         let _ = self.editor.copy_task_summary_by_index(self.index()).await?;
 
@@ -134,27 +138,31 @@ impl<'a> TraeTaskHandler<'a> {
     }
 
     pub async fn retry_task(&self) -> Result<(), Error> {
+        let _ui_guard = self.editor.acquire_ui_lock().await;
         // switch to target task item
-        let _ = self.select().await?;
+        let _ = self.editor.select_task_by_index(self.index()).await?;
         self.editor.retry_task_by_index(self.index()).await
     }
 
     pub async fn feedback(&self, feedback: TraeSoloTaskFeedback) -> Result<(), Error> {
+        let _ui_guard = self.editor.acquire_ui_lock().await;
         // switch to target task item
-        let _ = self.select().await?;
+        let _ = self.editor.select_task_by_index(self.index()).await?;
         self.editor
             .feedback_task_by_index(self.index(), feedback)
             .await
     }
 
     pub async fn terminate(&self) -> Result<(), Error> {
-        let _ = self.select().await?;
+        let _ui_guard = self.editor.acquire_ui_lock().await;
+        let _ = self.editor.select_task_by_index(self.index()).await?;
 
         self.editor.terminate_task_by_index(self.index()).await
     }
 
     pub async fn trigger_send(&self) -> Result<(), Error> {
-        let _ = self.select().await?;
+        let _ui_guard = self.editor.acquire_ui_lock().await;
+        let _ = self.editor.select_task_by_index(self.index()).await?;
 
         self.editor.click_send_button_by_index(self.index()).await
     }

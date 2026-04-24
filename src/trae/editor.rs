@@ -19,8 +19,8 @@ use chromiumoxide::Element;
 use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
 use chromiumoxide::{Browser, Page, cdp::browser_protocol::target::TargetInfo};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
 use tokio::sync::watch::Receiver;
+use tokio::sync::{Mutex, MutexGuard, RwLock};
 use tokio::time::{self, Duration, Instant, sleep};
 
 // TODO: Refactor
@@ -32,6 +32,8 @@ pub struct TraeEditor {
     pub(crate) prebuilt_agent: TraeEditorPrebuiltSoloAgent,
     pub mode: TraeEditorMode,
     pub(crate) tasks: RwLock<Vec<TraeTask>>,
+    // Serializes multi-step interactions against Trae's single focused UI.
+    pub(crate) ui_lock: Mutex<()>,
     pub config: Config,
 }
 
@@ -202,6 +204,7 @@ impl TraeEditorBuilder {
             mode: current_mode,
             config,
             tasks: RwLock::new(Vec::new()),
+            ui_lock: Mutex::new(()),
         };
     }
 }
@@ -213,6 +216,10 @@ impl TraeEditor {
 
     pub fn get_current_mode(&self) -> &TraeEditorMode {
         &self.mode
+    }
+
+    pub(crate) async fn acquire_ui_lock(&self) -> MutexGuard<'_, ()> {
+        self.ui_lock.lock().await
     }
 
     pub async fn get_main_page(&self) -> &Page {
@@ -1408,9 +1415,13 @@ impl TraeEditor {
         initial_policy: InitialTaskPolicy,
         mut shutdown_rx: Receiver<bool>,
     ) {
-        match self.bootstrap_tasks_with_events(initial_policy).await {
-            Ok(events) => self.dispatch_task_events(&workflow, events).await,
-            Err(err) => eprintln!("bootstrap_tasks_with_events failed: {err:?}"),
+        {
+            // Bootstrap can replay many pending tasks; keep the whole batch ordered.
+            let _ui_guard = self.acquire_ui_lock().await;
+            match self.bootstrap_tasks_with_events(initial_policy).await {
+                Ok(events) => self.dispatch_task_events(&workflow, events).await,
+                Err(err) => eprintln!("bootstrap_tasks_with_events failed: {err:?}"),
+            }
         }
 
         let mut ticker = time::interval(interval);
@@ -1420,6 +1431,8 @@ impl TraeEditor {
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
+                    // Poll and handle each batch as one UI transaction.
+                    let _ui_guard = self.acquire_ui_lock().await;
                     match self.refresh_tasks_with_events().await {
                         Ok(events) => {
                             self.dispatch_task_events(&workflow, events).await;
