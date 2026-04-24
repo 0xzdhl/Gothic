@@ -18,6 +18,16 @@
             ],
             "default": "allow"
         },
+        "question_strategy": {
+            "type": "string",
+            "description": "How the Gothic handles human in the loop question (operation). \n\n- skip: skip all the questions. \n- auto: select an option randomly.\n- llm: invoke llm to decide.",
+            "enum": [
+                "skip",
+                "auto",
+                "llm"
+            ],
+            "default": "auto"
+        },
         "model": {
             "type": "object",
             "description": "LLM Configuration.",
@@ -28,7 +38,12 @@
                 },
                 "base_url": {
                     "type": "string",
-                    "description": "OpenAi compatible base url."
+                    "description": "OpenAI compatible base url."
+                },
+                "model_name": {
+                    "type": "string",
+                    "description": "Model name used when command_strategy or question_strategy is llm.",
+                    "default": "gpt-5-mini"
                 }
             },
             "required": [
@@ -38,7 +53,6 @@
         }
     },
     "required": [
-        "trae_executable_path",
-        "command_strategy"
+        "trae_executable_path"
     ]
 }

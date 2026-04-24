@@ -112,16 +112,20 @@ impl<'a> TraeTaskHandler<'a> {
     }
 
     pub async fn select(&self) -> Result<(), Error> {
+        let _ui_guard = self.editor.acquire_ui_lock().await;
         self.editor.select_task_by_index(self.index()).await
     }
 
     pub async fn type_content(&self, content: &str) -> Result<(), Error> {
+        let _ui_guard = self.editor.acquire_ui_lock().await;
+        let _ = self.editor.select_task_by_index(self.index()).await?;
         self.editor.type_content_to_chat_input(content).await
     }
 
     pub async fn copy_summary(&self) -> Result<String, Error> {
+        let _ui_guard = self.editor.acquire_ui_lock().await;
         // switch to target task item
-        let _ = self.select().await?;
+        let _ = self.editor.select_task_by_index(self.index()).await?;
 
         let _ = self.editor.copy_task_summary_by_index(self.index()).await?;
 
@@ -134,27 +138,31 @@ impl<'a> TraeTaskHandler<'a> {
     }
 
     pub async fn retry_task(&self) -> Result<(), Error> {
+        let _ui_guard = self.editor.acquire_ui_lock().await;
         // switch to target task item
-        let _ = self.select().await?;
+        let _ = self.editor.select_task_by_index(self.index()).await?;
         self.editor.retry_task_by_index(self.index()).await
     }
 
     pub async fn feedback(&self, feedback: TraeSoloTaskFeedback) -> Result<(), Error> {
+        let _ui_guard = self.editor.acquire_ui_lock().await;
         // switch to target task item
-        let _ = self.select().await?;
+        let _ = self.editor.select_task_by_index(self.index()).await?;
         self.editor
             .feedback_task_by_index(self.index(), feedback)
             .await
     }
 
     pub async fn terminate(&self) -> Result<(), Error> {
-        let _ = self.select().await?;
+        let _ui_guard = self.editor.acquire_ui_lock().await;
+        let _ = self.editor.select_task_by_index(self.index()).await?;
 
         self.editor.terminate_task_by_index(self.index()).await
     }
 
     pub async fn trigger_send(&self) -> Result<(), Error> {
-        let _ = self.select().await?;
+        let _ui_guard = self.editor.acquire_ui_lock().await;
+        let _ = self.editor.select_task_by_index(self.index()).await?;
 
         self.editor.click_send_button_by_index(self.index()).await
     }
@@ -184,6 +192,10 @@ pub enum ActionOp {
     WaitForSelector { selector: String, timeout_ms: u64 },
     AllowCommand,
     RejectCommand,
+    // WaitingForHITL 下的统一动作入口。
+    // 与其让 workflow 预先判断“当前是命令卡还是问题卡”，
+    // 不如把判断逻辑下沉到 editor 里直接看实际 DOM。
+    HandleHumanInLoop,
     SleepMs(u64),
     Custom(Arc<dyn CustomAction>),
 }
@@ -254,6 +266,11 @@ impl ActionChain {
 
     pub fn reject_command(self) -> Self {
         self.then(ActionOp::RejectCommand)
+    }
+
+    // 给 workflow 提供一个更语义化的 builder，避免上层继续直接拼 Allow/RejectCommand。
+    pub fn handle_human_in_loop(self) -> Self {
+        self.then(ActionOp::HandleHumanInLoop)
     }
 
     pub fn custom<A: CustomAction + 'static>(mut self, action: A) -> Self {

@@ -1,6 +1,7 @@
+use crate::trae::consts::*;
+use crate::trae::editor::TraeEditor;
 use crate::trae::types::*;
 use crate::utils::wait_for_selector;
-use crate::{consts::DEFAULT_SELECTOR_TIMEOUT, trae::editor::TraeEditor};
 use anyhow::{Error, Result};
 use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
 use tokio::time::{Duration, sleep};
@@ -27,6 +28,8 @@ impl<'a> NewTraeTask<'a> {
     }
 
     pub async fn execute(&self) -> Result<(), Error> {
+        let _ui_guard = self.editor.acquire_ui_lock().await;
+
         self.ensure_solo_mode().await?;
 
         let _ = wait_for_selector(

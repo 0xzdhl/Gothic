@@ -3,8 +3,7 @@ use chromiumoxide::Browser;
 use futures::StreamExt;
 use gothic::config::Config;
 use gothic::trae::{
-    ActionChain, CommandAction, CustomActionExample, InitialTaskPolicy, TaskWorkflow, TraeEditor,
-    TraeEditorMode,
+    ActionChain, CustomActionExample, InitialTaskPolicy, TaskWorkflow, TraeEditor, TraeEditorMode,
 };
 use gothic::utils::{wait_for_debug_port, wait_for_shutdown};
 use std::process::Stdio;
@@ -61,18 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // create a new task
     {
         quick_task("翻译：我喜欢使用Python编程为日语。", &trae_editor).await;
-        // quick_task("帮我做一个淘宝网，我需要全部的功能", &trae_editor).await;
-        // quick_task(
-        //     "写一个小红书脚本，抓取特定关键词的热门帖子数据",
-        //     &trae_editor,
-        // )
-        // .await;
-        // quick_task("我想要做一个二手交易网站，我该怎么设计？", &trae_editor).await;
-        // quick_task(
-        //     "我是一个编程小白, 我想要学习Typescript, 我该从哪里开始?",
-        //     &trae_editor,
-        // )
-        // .await;
+        quick_task("帮我制作一个网站，制作之前你要先提供一些选项给我让我选择（单选+多选）要做什么类型的网站，我选完之后你再开始写", &trae_editor).await;
     }
 
     // sleep 3 secs
@@ -169,10 +157,13 @@ fn build_task_workflow() -> TaskWorkflow {
             .type_text("继续")
             .sleep_ms(1000)
             .press_enter(),
-        // .press_enter(),
+
+        // WaitingForHITL 现在统一走 `handle_human_in_loop`：
+        // editor 会根据实际弹出的 DOM 自动分发到 command / questionnaire。
+        // 这样 workflow 层就不需要预先知道当前是哪一种 HITL 场景。
         on_waiting_for_hitl: ActionChain::new()
             .focus_task()
             .sleep_ms(1000)
-            .custom(CommandAction),
+            .handle_human_in_loop(),
     }
 }

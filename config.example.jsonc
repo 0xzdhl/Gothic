@@ -4,8 +4,10 @@
 	// Path to your Trae executable file
 	"trae_executable_path": "",
 	"command_strategy": "allow",
+	"question_strategy": "auto",
 	"model": {
 		"api_key": "",
-		"base_url": ""
+		"base_url": "",
+		"model_name": "gpt-5-mini"
 	}
 }

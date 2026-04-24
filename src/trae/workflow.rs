@@ -48,6 +48,9 @@ pub async fn execute_action_chain(
             ActionOp::SleepMs(ms) => sleep(Duration::from_millis(*ms)).await,
             ActionOp::AllowCommand => editor.allow_command_by_index(task.index).await?,
             ActionOp::RejectCommand => editor.reject_command_by_index(task.index).await?,
+            // WaitingForHITL 进入这里后，不再由 workflow 假设具体卡片类型，
+            // 而是交给 editor 读取 DOM 后决定走 command 还是 questionnaire 分支。
+            ActionOp::HandleHumanInLoop => editor.handle_human_in_loop_by_index(task.index).await?,
             ActionOp::Custom(action) => {
                 action
                     .run(ActionContext {
@@ -95,43 +98,7 @@ impl CustomAction for CustomActionExample {
             ctx.editor.focus_task_by_index(ctx.task.index).await?;
             ctx.editor.focus_chat_input().await?;
             ctx.editor.clear_chat_input().await?;
-            ctx.editor
-                .insert_text_to_focused_input("Hello World")
-                .await?;
             println!("Custom Action Triggered");
-            Ok(())
-        })
-    }
-}
-
-#[derive(Debug)]
-pub struct CommandAction;
-
-impl CustomAction for CommandAction {
-    fn name(&self) -> &'static str {
-        "command_action"
-    }
-
-    fn run<'a>(&'a self, ctx: ActionContext<'a>) -> super::ActionFuture<'a> {
-        // TODO: Question Card
-        Box::pin(async move {
-            let command_strategy = &ctx.editor.config.command_strategy;
-
-            // scene 1: Need interact with command card
-            match command_strategy {
-                crate::config::CommandStrategy::Allow => {
-                    ctx.editor.allow_command_by_index(ctx.task.index).await?
-                }
-                crate::config::CommandStrategy::Deny => {
-                    ctx.editor.reject_command_by_index(ctx.task.index).await?
-                }
-                crate::config::CommandStrategy::LLM => {
-                    todo!("LLM integration has not implemented yet.")
-                }
-            }
-
-            // scene 2: Need interact with question card (single/multiple)
-
             Ok(())
         })
     }

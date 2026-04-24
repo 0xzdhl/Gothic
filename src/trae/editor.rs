@@ -1,38 +1,29 @@
-use crate::config::Config;
-use crate::consts::*;
+use crate::config::{CommandStrategy, Config, QuestionStrategy};
 use crate::trae::{
     NewTraeTask, TraeTask, TraeTaskStatus, diff_task_status_changes, handle_task_status_change,
     types::*,
 };
+
+use crate::trae::consts::*;
 use crate::utils::{normalize_executable_path_for_cdp, wait_for_selector};
-use anyhow::{Error, Result};
+use anyhow::{Error, Result, bail};
+use async_openai::{
+    Client,
+    config::OpenAIConfig,
+    types::chat::{
+        ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
+        CreateChatCompletionRequestArgs, ResponseFormat,
+    },
+};
 use chromiumoxide::Element;
 use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
 use chromiumoxide::{Browser, Page, cdp::browser_protocol::target::TargetInfo};
-use serde::Deserialize;
-use tokio::sync::RwLock;
+use serde::{Deserialize, Serialize};
 use tokio::sync::watch::Receiver;
+use tokio::sync::{Mutex, MutexGuard, RwLock};
 use tokio::time::{self, Duration, Instant, sleep};
 
 // TODO: Refactor
-const CHAT_INPUT_SELECTOR: &str =
-    "#agent-chat-view div.chat-input-wrapper div.chat-input-v2-input-box-editable";
-
-const COMMAND_CARD_SELECTOR: &str = "div[class*=icd-run-command-card-v2-command-shell],div[class*=icd-delete-files-command-card-v2]";
-const DELETE_COMMAND_CARD_CLASS: &str = "icd-delete-files-command-card-v2";
-const DELETE_COMMAND_TEXT_SELECTOR: &str = "div[class*=icd-delete-files-command-card-v2-cwd]";
-const RUN_COMMAND_TEXT_SELECTOR: &str = "div[class*=icd-run-command-card-v2-command-shell]";
-const DELETE_COMMAND_ALLOW_SELECTOR: &str =
-    "button[class*=icd-delete-files-command-card-v2-actions-delete]";
-const DELETE_COMMAND_REJECT_SELECTOR: &str =
-    "button[class*=icd-delete-files-command-card-v2-actions-cancel]";
-const RUN_COMMAND_ALLOW_SELECTOR: &str = "button[class*=icd-run-command-card-v2-actions-btn-run]";
-const RUN_COMMAND_REJECT_SELECTOR: &str =
-    "button[class*=icd-run-command-card-v2-actions-btn-cancel]";
-const DELETE_CONFIRM_POPOVER_SELECTOR: &str = "div[class*=confirm-popover-body]";
-const DELETE_CONFIRM_BUTTON_TEXT: &str = "\u{786E}\u{8BA4}";
-const COMMAND_ACTION_TIMEOUT_MS: u64 = 1000 * 30;
-const COMMAND_ACTION_POLL_INTERVAL_MS: u64 = 300;
 
 #[derive(Debug)]
 pub struct TraeEditor {
@@ -41,6 +32,8 @@ pub struct TraeEditor {
     pub(crate) prebuilt_agent: TraeEditorPrebuiltSoloAgent,
     pub mode: TraeEditorMode,
     pub(crate) tasks: RwLock<Vec<TraeTask>>,
+    // Serializes multi-step interactions against Trae's single focused UI.
+    pub(crate) ui_lock: Mutex<()>,
     pub config: Config,
 }
 
@@ -102,6 +95,37 @@ impl CommandDecision {
 struct PendingCommandAction {
     kind: CommandCardKind,
     raw_command: String,
+}
+
+/// Human in the loop kind
+/// Command: shell execution, delete files, .etc
+/// Questionnaire: model will ask human a few questions
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HitlPromptKind {
+    Command,
+    Questionnaire,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct QuestionnaireOption {
+    title: String,
+    description: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct Questionnaire {
+    context: String,
+    question: String,
+    options: Vec<QuestionnaireOption>,
+    is_multiple: bool,
+    // if the option contains a textarea
+    has_text_input: bool,
+    text_input_placeholder: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmQuestionSelection {
+    option_indices: Vec<usize>,
 }
 
 pub async fn get_current_editor_mode(page: &Page) -> Result<TraeEditorMode, Error> {
@@ -180,6 +204,7 @@ impl TraeEditorBuilder {
             mode: current_mode,
             config,
             tasks: RwLock::new(Vec::new()),
+            ui_lock: Mutex::new(()),
         };
     }
 }
@@ -191,6 +216,10 @@ impl TraeEditor {
 
     pub fn get_current_mode(&self) -> &TraeEditorMode {
         &self.mode
+    }
+
+    pub(crate) async fn acquire_ui_lock(&self) -> MutexGuard<'_, ()> {
+        self.ui_lock.lock().await
     }
 
     pub async fn get_main_page(&self) -> &Page {
@@ -643,6 +672,566 @@ impl TraeEditor {
             .await
     }
 
+    async fn detect_hitl_prompt_kind(&self) -> Result<Option<HitlPromptKind>, Error> {
+        // use `:?` to check string literal in debug
+        let question_selector = format!("{QUESTION_CARD_SELECTOR:?}");
+        let command_selector = format!("{COMMAND_CARD_SELECTOR:?}");
+
+        let raw_kind: Option<String> = self
+            .main_page
+            .evaluate(format!(
+                r#"
+        (() => {{
+            if (document.querySelector({question_selector})) {{
+                return "question";
+            }}
+
+            if (document.querySelector({command_selector})) {{
+                return "command";
+            }}
+
+            return null;
+        }})()
+        "#
+            ))
+            .await?
+            .into_value()?;
+
+        Ok(match raw_kind.as_deref() {
+            Some("question") => Some(HitlPromptKind::Questionnaire),
+            Some("command") => Some(HitlPromptKind::Command),
+            _ => None,
+        })
+    }
+
+    async fn wait_for_hitl_prompt_kind(&self) -> Result<HitlPromptKind, Error> {
+        let timeout = Duration::from_millis(HITL_PROMPT_TIMEOUT_MS); // 10 secs
+        let start = Instant::now();
+
+        // wait until the prompt card to display
+        while start.elapsed() < timeout {
+            if let Some(kind) = self.detect_hitl_prompt_kind().await? {
+                return Ok(kind);
+            }
+
+            sleep(Duration::from_millis(COMMAND_ACTION_POLL_INTERVAL_MS)).await;
+        }
+
+        Err(Error::msg(
+            "Cannot find a pending HITL command card or question card.",
+        ))
+    }
+
+    async fn handle_configured_command_by_index(&self, index: usize) -> Result<(), Error> {
+        match self.config.command_strategy {
+            CommandStrategy::Allow => self.allow_command_by_index(index).await,
+            CommandStrategy::Deny => self.reject_command_by_index(index).await,
+            CommandStrategy::LLM => Err(Error::msg(
+                "command_strategy = \"llm\" is not implemented yet. Use \"allow\" or \"deny\".",
+            )),
+        }
+    }
+
+    async fn answer_questionnaire_by_index(&self, index: usize) -> Result<(), Error> {
+        self.select_task_by_index(index).await?;
+
+        // QUESTION_MAX_STEPS is a safety valve for infinite loop
+        for step in 0..QUESTION_MAX_STEPS {
+            let Some(question) = self.extract_questionnaire().await? else {
+                // No question card found, throw an error
+                if step == 0 {
+                    bail!("Cannot find a pending questionnaire card.");
+                }
+
+                return Ok(());
+            };
+
+            let signature = Self::questionnaire_signature(&question);
+            self.answer_current_questionnaire(&question).await?;
+
+            // 给页面一点时间完成切换动画 / DOM 更新，减少立刻检查造成的假阴性。
+            sleep(Duration::from_millis(1000)).await;
+
+            if matches!(self.config.question_strategy, QuestionStrategy::Skip) {
+                return Ok(());
+            }
+
+            self.wait_for_question_transition(&signature).await?;
+        }
+
+        Err(Error::msg(format!(
+            "Questionnaire did not finish within {} steps.",
+            QUESTION_MAX_STEPS
+        )))
+    }
+
+    async fn extract_questionnaire(&self) -> Result<Option<Questionnaire>, Error> {
+        let card_selector = format!("{QUESTION_CARD_SELECTOR:?}");
+        let title_selector = format!("{QUESTION_TITLE_SELECTOR:?}");
+        let option_content_selector = format!("{QUESTION_OPTION_CONTENT_SELECTOR:?}");
+        let option_label_selector = format!("{QUESTION_OPTION_LABEL_SELECTOR:?}");
+        let option_description_selector = format!("{QUESTION_OPTION_DESCRIPTION_SELECTOR:?}");
+        let context_selector = format!("{QUESTION_CONTEXT_SELECTOR:?}");
+        let multiple_choice_selector = format!("{QUESTION_MULTIPLE_CHOICE_SELECTOR:?}");
+        let textarea_selector = format!("{QUESTION_TEXTAREA_SELECTOR:?}");
+
+        Ok(self
+            .main_page
+            .evaluate(format!(
+                r#"
+        (() => {{
+            // only read pending card
+            const card = document.querySelector({card_selector});
+            if (!(card instanceof HTMLElement)) {{
+                return null;
+            }}
+
+            const questionTitle = card.querySelector({title_selector});
+            const questionText = (questionTitle?.innerText ?? questionTitle?.textContent ?? '').trim();
+            if (!questionText) {{
+                return null;
+            }}
+
+            const textInput = card.querySelector({textarea_selector});
+            const hasTextInput = textInput instanceof HTMLTextAreaElement;
+            const textInputPlaceholder = hasTextInput
+                ? (textInput.getAttribute('placeholder') ?? '').trim()
+                : null;
+
+            // filter objective options (No input action required)
+            // - exclude `is-others`
+            // - exclude `input`
+            const options = Array.from(card.querySelectorAll({option_content_selector}))
+                .flatMap((item) => {{
+                    const container = item.closest('div[class*="icd-checkbox-item-container"]');
+                    if ((container?.className ?? '').toString().includes('is-others')) {{
+                        return [];
+                    }}
+
+                    const title = item.querySelector({option_label_selector});
+                    const titleText = (title?.innerText ?? title?.textContent ?? '').trim();
+                    if (!titleText || titleText === '其他') {{
+                        return [];
+                    }}
+
+                    const description = item.querySelector({option_description_selector});
+                    const descriptionText = (description?.innerText ?? description?.textContent ?? '').trim();
+
+                    return [{{
+                        title: titleText,
+                        description: descriptionText,
+                    }}];
+                }});
+
+            // A valid question card should be:
+            // 1. options
+            // 2. No options, but got textarea
+            if (options.length === 0 && !hasTextInput) {{
+                return null;
+            }}
+
+            const contextElements = Array.from(document.querySelectorAll({context_selector}));
+            const latestContext = contextElements.at(-1);
+            const context = (latestContext?.innerText ?? latestContext?.textContent ?? '').trim();
+            const isMultiple = !!card.querySelector({multiple_choice_selector});
+
+            return {{
+                context,
+                question: questionText,
+                options,
+                is_multiple: isMultiple,
+                has_text_input: hasTextInput,
+                text_input_placeholder: textInputPlaceholder,
+            }};
+        }})()
+        "#
+            ))
+            .await?
+            .into_value()?)
+    }
+
+    /// WaitingForHITL handler
+    pub async fn handle_human_in_loop_by_index(&self, index: usize) -> Result<(), Error> {
+        self.select_task_by_index(index).await?;
+
+        match self.wait_for_hitl_prompt_kind().await? {
+            HitlPromptKind::Command => self.handle_configured_command_by_index(index).await,
+            HitlPromptKind::Questionnaire => self.answer_questionnaire_by_index(index).await,
+        }
+    }
+
+    /// Generate a signature to check if the question is correctly handled
+    /// 1. question title may change sometime
+    /// 2. a question may contains multi options and perhaps a textarea
+    /// 3. encode question, option titles and textarea
+    fn questionnaire_signature(question: &Questionnaire) -> String {
+        let option_titles = question
+            .options
+            .iter()
+            .map(|option| option.title.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        format!(
+            "{}\n{}\n{}\n{}",
+            question.question,
+            option_titles,
+            question.has_text_input,
+            question
+                .text_input_placeholder
+                .as_deref()
+                .unwrap_or_default()
+        )
+    }
+
+    fn normalize_question_selection(
+        question: &Questionnaire,
+        mut indices: Vec<usize>,
+    ) -> Result<Vec<usize>, Error> {
+        indices.retain(|index| *index < question.options.len());
+        indices.sort_unstable();
+        indices.dedup();
+
+        if indices.is_empty() {
+            bail!(
+                "No valid option index was selected for question: {}",
+                question.question
+            );
+        }
+
+        if !question.is_multiple && indices.len() > 1 {
+            indices.truncate(1);
+        }
+
+        Ok(indices)
+    }
+
+    fn choose_random_question_option(&self, question: &Questionnaire) -> Result<Vec<usize>, Error> {
+        if question.options.is_empty() {
+            bail!("Cannot auto-answer a question without options.");
+        }
+
+        // only return an option
+        Ok(vec![rand::random_range(0..question.options.len())])
+    }
+
+    fn build_llm_client(&self) -> Client<OpenAIConfig> {
+        let mut openai_config = OpenAIConfig::new();
+        let model_config = &self.config.model;
+
+        if !model_config.api_key.trim().is_empty() {
+            openai_config = openai_config.with_api_key(model_config.api_key.trim());
+        }
+
+        if !model_config.base_url.trim().is_empty() {
+            openai_config = openai_config.with_api_base(model_config.base_url.trim());
+        }
+
+        Client::with_config(openai_config)
+    }
+
+    fn build_question_llm_prompt(question: &Questionnaire) -> Result<String, Error> {
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "task_context": question.context,
+            "question": question.question,
+            "is_multiple": question.is_multiple,
+            "options": question
+                .options
+                .iter()
+                .enumerate()
+                .map(|(index, option)| {
+                    serde_json::json!({
+                        "index": index,
+                        "title": option.title,
+                        "description": option.description,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            "response_schema": {
+                "option_indices": "array of zero-based option indexes to choose"
+            }
+        }))?)
+    }
+
+    /// JSON format fence for LLM response
+    fn parse_llm_question_selection(content: &str) -> Result<LlmQuestionSelection, Error> {
+        let trimmed = content.trim();
+
+        if let Ok(selection) = serde_json::from_str(trimmed) {
+            return Ok(selection);
+        }
+
+        let fenced = trimmed
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+
+        Ok(serde_json::from_str(fenced)?)
+    }
+
+    async fn choose_question_options_with_llm(
+        &self,
+        question: &Questionnaire,
+    ) -> Result<Vec<usize>, Error> {
+        let model_name = self.config.model.model_name.trim();
+        if model_name.is_empty() {
+            bail!("model.model_name cannot be empty when question_strategy = \"llm\".");
+        }
+
+        let request = CreateChatCompletionRequestArgs::default()
+            .model(model_name)
+            .messages([
+                ChatCompletionRequestSystemMessageArgs::default()
+                    .content(
+                        "You answer IDE assistant questionnaire cards. Return only JSON in the shape {\"option_indices\":[0]}. Use zero-based option indexes from the provided options. For single-choice questions, return exactly one index. Never invent options.",
+                    )
+                    .build()?
+                    .into(),
+                ChatCompletionRequestUserMessageArgs::default()
+                    .content(Self::build_question_llm_prompt(question)?)
+                    .build()?
+                    .into(),
+            ])
+            .response_format(ResponseFormat::JsonObject)
+            .temperature(0.0_f32)
+            .max_completion_tokens(128_u32)
+            .build()?;
+
+        let response = self.build_llm_client().chat().create(request).await?;
+        let content = response
+            .choices
+            .first()
+            .and_then(|choice| choice.message.content.as_deref())
+            .ok_or_else(|| Error::msg("LLM did not return a text answer for the question."))?;
+        let selection = Self::parse_llm_question_selection(content)?;
+
+        Self::normalize_question_selection(question, selection.option_indices)
+    }
+
+    async fn choose_question_option_indices(
+        &self,
+        question: &Questionnaire,
+    ) -> Result<Vec<usize>, Error> {
+        // decision maker on how to handle QA card
+        match self.config.question_strategy {
+            QuestionStrategy::Skip => Ok(Vec::new()),
+            QuestionStrategy::Auto => self.choose_random_question_option(question),
+            QuestionStrategy::LLM => self.choose_question_options_with_llm(question).await,
+        }
+    }
+
+    async fn click_question_cancel_action(&self) -> Result<bool, Error> {
+        let card_selector = format!("{QUESTION_CARD_SELECTOR:?}");
+        let action_bar_selector = format!("{QUESTION_ACTION_BAR_SELECTOR:?}");
+        let cancel_text = format!("{QUESTION_CANCEL_BUTTON_TEXT:?}");
+
+        Ok(self
+            .main_page
+            .evaluate(format!(
+                r#"
+        (() => {{
+            const card = document.querySelector({card_selector});
+            const actionBar = card?.querySelector({action_bar_selector});
+            if (!(actionBar instanceof HTMLElement)) {{
+                return false;
+            }}
+
+            const buttons = Array.from(actionBar.querySelectorAll('button'));
+            const target = buttons.find((button) => {{
+                const text = (button.textContent ?? button.innerText ?? '').trim();
+                return text === {cancel_text};
+            }}) ?? buttons.find((button) => (button.className ?? '').toString().includes('icd-btn-secondary'));
+
+            if (!(target instanceof HTMLElement)) {{
+                return false;
+            }}
+
+            target.click();
+            return true;
+        }})()
+        "#
+            ))
+            .await?
+            .into_value()?)
+    }
+
+    async fn click_question_option_by_index(&self, index: usize) -> Result<(), Error> {
+        let card_selector = format!("{QUESTION_CARD_SELECTOR:?}");
+        let option_content_selector = format!("{QUESTION_OPTION_CONTENT_SELECTOR:?}");
+        let option_label_selector = format!("{QUESTION_OPTION_LABEL_SELECTOR:?}");
+
+        // choose option by its index
+        let clicked: bool = self
+            .main_page
+            .evaluate(format!(
+                r#"
+        (() => {{
+            const card = document.querySelector({card_selector});
+            if (!(card instanceof HTMLElement)) {{
+                return false;
+            }}
+
+            const options = Array.from(card.querySelectorAll({option_content_selector}))
+                .filter((item) => {{
+                    const container = item.closest('div[class*="icd-checkbox-item-container"]');
+                    if ((container?.className ?? '').toString().includes('is-others')) {{
+                        return false;
+                    }}
+
+                    const title = item.querySelector({option_label_selector});
+                    const titleText = (title?.innerText ?? title?.textContent ?? '').trim();
+                    return !!titleText && titleText !== '其他';
+                }});
+
+            const target = options[{index}];
+            if (!(target instanceof HTMLElement)) {{
+                return false;
+            }}
+
+            const clickable = target.closest('div[class*="icd-checkbox-item-container"]') ?? target;
+            if (!(clickable instanceof HTMLElement)) {{
+                return false;
+            }}
+
+            clickable.click();
+            return true;
+        }})()
+        "#
+            ))
+            .await?
+            .into_value()?;
+
+        if !clicked {
+            bail!("Cannot click question option by index: {}", index);
+        }
+
+        sleep(Duration::from_millis(100)).await;
+        Ok(())
+    }
+
+    /// Click 'Next' and 'Submit' button
+    async fn click_question_primary_action(&self) -> Result<bool, Error> {
+        let card_selector = format!("{QUESTION_CARD_SELECTOR:?}");
+        let action_bar_selector = format!("{QUESTION_ACTION_BAR_SELECTOR:?}");
+        let cancel_text = format!("{QUESTION_CANCEL_BUTTON_TEXT:?}");
+
+        Ok(self
+            .main_page
+            .evaluate(format!(
+                r#"
+        (() => {{
+            const card = document.querySelector({card_selector});
+            const actionBar = card?.querySelector({action_bar_selector});
+            if (!(actionBar instanceof HTMLElement)) {{
+                return false;
+            }}
+
+            const buttons = Array.from(actionBar.querySelectorAll('button'))
+                .filter((button) => button.getAttribute('aria-disabled') !== 'true' && !button.disabled);
+            const target = buttons.find((button) => (button.className ?? '').toString().includes('icd-btn-primary'))
+                ?? buttons.find((button) => {{
+                    const text = (button.textContent ?? button.innerText ?? '').trim();
+                    return text && text !== {cancel_text};
+                }});
+
+            if (!(target instanceof HTMLElement)) {{
+                return false;
+            }}
+
+            target.click();
+            return true;
+        }})()
+        "#
+            ))
+            .await?
+            .into_value()?)
+    }
+
+    async fn wait_for_question_transition(&self, previous_signature: &str) -> Result<(), Error> {
+        let timeout = Duration::from_millis(QUESTION_TRANSITION_TIMEOUT_MS);
+        let start = Instant::now();
+
+        // Check if the current question finished:
+        // - go to next question: the signature should change
+        // - submit: question card container disappear from page, `extract_questionnaire` return None
+        // - not working: the signature remains the same and timeout
+        while start.elapsed() < timeout {
+            let current = self.extract_questionnaire().await?;
+            let current_signature = current.as_ref().map(Self::questionnaire_signature);
+
+            if current_signature.as_deref() != Some(previous_signature) {
+                return Ok(());
+            }
+
+            sleep(Duration::from_millis(QUESTION_TRANSITION_POLL_INTERVAL_MS)).await;
+        }
+
+        Err(Error::msg(
+            "Questionnaire did not transition after selecting an option.",
+        ))
+    }
+
+    async fn answer_current_questionnaire(&self, question: &Questionnaire) -> Result<(), Error> {
+        if matches!(self.config.question_strategy, QuestionStrategy::Skip) {
+            if !self.click_question_cancel_action().await? {
+                bail!("Cannot find the questionnaire cancel button.");
+            }
+
+            println!("Skipped Question: {}", question.question);
+            sleep(Duration::from_millis(300)).await;
+            return Ok(());
+        }
+
+        // As some questions may only contain textarea, no options presented. For example:
+        // Any extra info? (Optional).
+        //  __________________________
+        // |__________________________|
+        //
+        // For now we just skip them, because input text in the textarea will lead a lot of work and maybe bugs.
+        if question.options.is_empty() && question.has_text_input {
+            sleep(Duration::from_millis(200)).await;
+
+            if !self.click_question_primary_action().await? {
+                bail!("Cannot find the questionnaire primary action button.");
+            }
+
+            println!("Submitted Text Question Empty: {}", question.question);
+
+            return Ok(());
+        }
+
+        // For general QA:
+        // 1. decide which options should we choose
+        // 2. click them sequentially
+        // 3. click `Next` or `Submit`
+        let selected_indices = self.choose_question_option_indices(question).await?;
+
+        for index in &selected_indices {
+            self.click_question_option_by_index(*index).await?;
+        }
+
+        sleep(Duration::from_millis(200)).await;
+
+        if !self.click_question_primary_action().await? {
+            bail!("Cannot find the questionnaire primary action button.");
+        }
+
+        let selected_titles = selected_indices
+            .iter()
+            .filter_map(|index| question.options.get(*index))
+            .map(|option| option.title.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        println!(
+            "Answered Question: {} -> {}",
+            question.question, selected_titles
+        );
+
+        Ok(())
+    }
+
     pub async fn terminate_task_by_index(&self, index: usize) -> Result<(), Error> {
         let task = self.get_task_by_index(index).await?;
         match task.status {
@@ -826,9 +1415,13 @@ impl TraeEditor {
         initial_policy: InitialTaskPolicy,
         mut shutdown_rx: Receiver<bool>,
     ) {
-        match self.bootstrap_tasks_with_events(initial_policy).await {
-            Ok(events) => self.dispatch_task_events(&workflow, events).await,
-            Err(err) => eprintln!("bootstrap_tasks_with_events failed: {err:?}"),
+        {
+            // Bootstrap can replay many pending tasks; keep the whole batch ordered.
+            let _ui_guard = self.acquire_ui_lock().await;
+            match self.bootstrap_tasks_with_events(initial_policy).await {
+                Ok(events) => self.dispatch_task_events(&workflow, events).await,
+                Err(err) => eprintln!("bootstrap_tasks_with_events failed: {err:?}"),
+            }
         }
 
         let mut ticker = time::interval(interval);
@@ -838,6 +1431,8 @@ impl TraeEditor {
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
+                    // Poll and handle each batch as one UI transaction.
+                    let _ui_guard = self.acquire_ui_lock().await;
                     match self.refresh_tasks_with_events().await {
                         Ok(events) => {
                             self.dispatch_task_events(&workflow, events).await;
