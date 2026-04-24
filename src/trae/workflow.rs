@@ -98,28 +98,7 @@ impl CustomAction for CustomActionExample {
             ctx.editor.focus_task_by_index(ctx.task.index).await?;
             ctx.editor.focus_chat_input().await?;
             ctx.editor.clear_chat_input().await?;
-            // ctx.editor
-            //     .insert_text_to_focused_input("Hello World")
-            //     .await?;
             println!("Custom Action Triggered");
-            Ok(())
-        })
-    }
-}
-
-#[derive(Debug)]
-pub struct CommandAction;
-
-impl CustomAction for CommandAction {
-    fn name(&self) -> &'static str {
-        "hitl_action"
-    }
-
-    fn run<'a>(&'a self, ctx: ActionContext<'a>) -> super::ActionFuture<'a> {
-        Box::pin(async move {
-            ctx.editor
-                .handle_human_in_loop_by_index(ctx.task.index)
-                .await?;
             Ok(())
         })
     }
