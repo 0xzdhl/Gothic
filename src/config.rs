@@ -49,6 +49,10 @@ fn default_question_strategy() -> QuestionStrategy {
     QuestionStrategy::Auto
 }
 
+fn default_max_concurrent_task() -> u32 {
+    5
+}
+
 #[derive(Deserialize, Debug)]
 pub struct Config {
     pub trae_executable_path: String,
@@ -58,6 +62,8 @@ pub struct Config {
     pub question_strategy: QuestionStrategy,
     #[serde(default)]
     pub model: ModelConfig,
+    #[serde(default = "default_max_concurrent_task")]
+    pub max_concurrent_task: u32,
 }
 
 impl Config {

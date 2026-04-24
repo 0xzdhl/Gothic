@@ -28,6 +28,12 @@
             ],
             "default": "auto"
         },
+        "max_concurrent_task": {
+            "type": "integer",
+            "description": "The maximum number of concurrent tasks. Recommended <= 10.",
+            "minimum": 1,
+            "default": 5
+        },
         "model": {
             "type": "object",
             "description": "LLM Configuration.",

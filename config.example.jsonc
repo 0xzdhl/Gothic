@@ -5,6 +5,7 @@
 	"trae_executable_path": "",
 	"command_strategy": "allow",
 	"question_strategy": "auto",
+	"max_concurrent_task": 5,
 	"model": {
 		"api_key": "",
 		"base_url": "",
