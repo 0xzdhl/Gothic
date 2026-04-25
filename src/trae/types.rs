@@ -121,7 +121,9 @@ impl<'a> TraeTaskHandler<'a> {
     }
 
     pub async fn refresh(&self) -> Result<TraeTaskHandler<'a>, Error> {
-        self.editor.get_task_handle_by_id(self.snapshot.task_id).await
+        self.editor
+            .get_task_handle_by_id(self.snapshot.task_id)
+            .await
     }
 
     pub async fn select(&self) -> Result<(), Error> {
@@ -161,7 +163,9 @@ impl<'a> TraeTaskHandler<'a> {
         let _ui_guard = self.editor.acquire_ui_lock().await;
         // Feedback buttons belong to the active task panel, not to a stable DOM node.
         let _ = self.editor.select_task_by_id(self.task_id()).await?;
-        self.editor.feedback_task_by_id(self.task_id(), feedback).await
+        self.editor
+            .feedback_task_by_id(self.task_id(), feedback)
+            .await
     }
 
     pub async fn terminate(&self) -> Result<(), Error> {

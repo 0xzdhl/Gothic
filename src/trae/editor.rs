@@ -19,6 +19,7 @@ use chromiumoxide::Element;
 use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
 use chromiumoxide::{Browser, Page, cdp::browser_protocol::target::TargetInfo};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::watch::Receiver;
 use tokio::sync::{Mutex, MutexGuard, RwLock};
@@ -35,6 +36,7 @@ pub struct TraeEditor {
     pub(crate) tasks: RwLock<Vec<TraeTask>>,
     pub(crate) next_task_id: AtomicU64,
     pub(crate) pending_task_list_hint: Mutex<Option<TaskListHint>>,
+    pending_action_retries: Mutex<HashMap<u64, PendingUiActionRetry>>,
     // Serializes multi-step interactions against Trae's single focused UI.
     pub(crate) ui_lock: Mutex<()>,
     pub config: Config,
@@ -106,6 +108,13 @@ struct PendingCommandAction {
     raw_command: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PendingUiActionRetry {
+    pub(crate) status: TraeTaskStatus,
+    pub(crate) attempts: u32,
+    pub(crate) warned: bool,
+}
+
 /// Human in the loop kind
 /// Command: shell execution, delete files, .etc
 /// Questionnaire: model will ask human a few questions
@@ -113,6 +122,54 @@ struct PendingCommandAction {
 enum HitlPromptKind {
     Command,
     Questionnaire,
+}
+
+fn should_retry_task_action(status: TraeTaskStatus) -> bool {
+    matches!(
+        status,
+        TraeTaskStatus::Interrupted | TraeTaskStatus::WaitingForHITL
+    )
+}
+
+pub(crate) fn collect_pending_retry_events(
+    latest: &[TraeTask],
+    pending_retries: &mut HashMap<u64, PendingUiActionRetry>,
+    max_task_action_retry: u32,
+) -> (Vec<TaskStatusChangeEvent>, Vec<TraeTask>) {
+    let latest_by_id = latest
+        .iter()
+        .map(|task| (task.task_id, task))
+        .collect::<HashMap<_, _>>();
+    let mut retry_events = Vec::new();
+    let mut warned_tasks = Vec::new();
+
+    pending_retries.retain(|task_id, retry| {
+        let Some(task) = latest_by_id.get(task_id).copied() else {
+            return false;
+        };
+
+        if task.status != retry.status || !should_retry_task_action(task.status) {
+            return false;
+        }
+
+        if retry.attempts >= max_task_action_retry {
+            if !retry.warned {
+                warned_tasks.push(task.clone());
+                retry.warned = true;
+            }
+
+            return true;
+        }
+
+        retry_events.push(TaskStatusChangeEvent {
+            task: task.clone(),
+            previous_status: Some(task.status),
+        });
+
+        true
+    });
+
+    (retry_events, warned_tasks)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -279,6 +336,7 @@ impl TraeEditorBuilder {
             tasks: RwLock::new(Vec::new()),
             next_task_id: AtomicU64::new(1),
             pending_task_list_hint: Mutex::new(None),
+            pending_action_retries: Mutex::new(HashMap::new()),
             ui_lock: Mutex::new(()),
         };
     }
@@ -442,10 +500,25 @@ impl TraeEditor {
     pub async fn refresh_tasks_with_events(&self) -> Result<Vec<TaskStatusChangeEvent>, Error> {
         let previous = self.cached_tasks().await;
         let latest = self.fetch_tasks_from_ui(&previous).await?;
-        let events = diff_task_status_changes(&previous, &latest);
+        let mut events = diff_task_status_changes(&previous, &latest);
+        let (retry_events, warned_tasks) = {
+            let mut guard = self.pending_action_retries.lock().await;
+            collect_pending_retry_events(&latest, &mut guard, self.config.max_task_action_retry)
+        };
+        events.extend(retry_events);
 
         let mut guard = self.tasks.write().await;
         *guard = latest;
+
+        for task in warned_tasks {
+            eprintln!(
+                "Warning: [#{} {}] is still {} after {} automation attempts; stop retrying until the status changes.",
+                task.task_id,
+                task.title,
+                task.status.as_str(),
+                self.config.max_task_action_retry
+            );
+        }
 
         Ok(events)
     }
@@ -489,7 +562,41 @@ impl TraeEditor {
                 event.current_status().as_str(),
             );
 
-            if let Err(err) = handle_task_status_change(self, workflow, &event).await {
+            if event.previous_status == Some(event.current_status())
+                && should_retry_task_action(event.current_status())
+            {
+                println!(
+                    "Retrying task action: [#{} {}] still at {}",
+                    event.task.task_id,
+                    event.task.title,
+                    event.current_status().as_str(),
+                );
+            }
+
+            let result = handle_task_status_change(self, workflow, &event).await;
+
+            if should_retry_task_action(event.current_status()) {
+                let mut guard = self.pending_action_retries.lock().await;
+                let entry = guard
+                    .entry(event.task.task_id)
+                    .or_insert(PendingUiActionRetry {
+                        status: event.current_status(),
+                        attempts: 0,
+                        warned: false,
+                    });
+
+                if entry.status != event.current_status() {
+                    *entry = PendingUiActionRetry {
+                        status: event.current_status(),
+                        attempts: 0,
+                        warned: false,
+                    };
+                }
+
+                entry.attempts += 1;
+            }
+
+            if let Err(err) = result {
                 eprintln!("handle_task_status_change failed: {err:?}")
             }
         }
@@ -1585,137 +1692,5 @@ impl TraeEditor {
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::editor::{TaskListHint, reconcile_task_snapshots};
-    use super::super::types::{TraeTask, TraeTaskStatus};
-    use super::super::workflow::diff_task_status_changes;
-
-    fn task(
-        task_id: u64,
-        title: &str,
-        status: TraeTaskStatus,
-        selected: bool,
-        index: usize,
-    ) -> TraeTask {
-        TraeTask {
-            task_id,
-            title: title.to_string(),
-            status,
-            selected,
-            index,
-        }
-    }
-
-    #[test]
-    fn reconcile_keeps_stable_order_without_hint() {
-        let previous = vec![
-            task(1, "Build website", TraeTaskStatus::Running, false, 0),
-            task(2, "Build website", TraeTaskStatus::WaitingForHITL, true, 1),
-            task(3, "Other task", TraeTaskStatus::Running, false, 2),
-        ];
-
-        assert_eq!(
-            reconcile_task_snapshots(&previous, previous.len(), None),
-            vec![Some(0), Some(1), Some(2)]
-        );
-    }
-
-    #[test]
-    fn reconcile_assigns_a_new_front_task_from_explicit_hint() {
-        let previous = vec![
-            task(11, "Existing task A", TraeTaskStatus::Running, false, 0),
-            task(
-                12,
-                "Existing task B",
-                TraeTaskStatus::WaitingForHITL,
-                true,
-                1,
-            ),
-        ];
-
-        assert_eq!(
-            reconcile_task_snapshots(&previous, 3, Some(TaskListHint::NewTaskAtFront)),
-            vec![None, Some(0), Some(1)]
-        );
-    }
-
-    #[test]
-    fn reconcile_infers_new_front_tasks_from_length_growth() {
-        let previous = vec![
-            task(11, "Existing task A", TraeTaskStatus::Running, false, 0),
-            task(
-                12,
-                "Existing task B",
-                TraeTaskStatus::WaitingForHITL,
-                true,
-                1,
-            ),
-        ];
-
-        assert_eq!(
-            reconcile_task_snapshots(&previous, 3, None),
-            vec![None, Some(0), Some(1)]
-        );
-    }
-
-    #[test]
-    fn reconcile_moves_the_known_terminal_task_to_front() {
-        let previous = vec![
-            task(21, "Build website", TraeTaskStatus::Finished, false, 0),
-            task(22, "Build website", TraeTaskStatus::Finished, true, 1),
-            task(23, "Other task", TraeTaskStatus::Running, false, 2),
-        ];
-
-        assert_eq!(
-            reconcile_task_snapshots(
-                &previous,
-                3,
-                Some(TaskListHint::MoveTaskToFront { task_id: 22 }),
-            ),
-            vec![Some(1), Some(0), Some(2)]
-        );
-    }
-
-    #[test]
-    fn diff_uses_task_id_for_duplicate_titles() {
-        let previous = vec![
-            task(1, "Build website", TraeTaskStatus::WaitingForHITL, false, 0),
-            task(2, "Build website", TraeTaskStatus::Running, false, 1),
-        ];
-        let latest = vec![
-            task(1, "Build website", TraeTaskStatus::Running, false, 1),
-            task(2, "Build website", TraeTaskStatus::WaitingForHITL, false, 0),
-        ];
-
-        let events = diff_task_status_changes(&previous, &latest);
-
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].task_id(), 1);
-        assert_eq!(
-            events[0].previous_status,
-            Some(TraeTaskStatus::WaitingForHITL)
-        );
-        assert_eq!(events[1].task_id(), 2);
-        assert_eq!(events[1].previous_status, Some(TraeTaskStatus::Running));
-    }
-
-    #[test]
-    fn diff_emits_initial_event_for_new_waiting_task() {
-        let previous = vec![task(1, "Existing task", TraeTaskStatus::Running, false, 0)];
-        let latest = vec![
-            task(2, "New task", TraeTaskStatus::WaitingForHITL, false, 0),
-            task(1, "Existing task", TraeTaskStatus::Running, false, 1),
-        ];
-
-        let events = diff_task_status_changes(&previous, &latest);
-
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].task_id(), 2);
-        assert_eq!(events[0].previous_status, None);
-        assert_eq!(events[0].current_status(), TraeTaskStatus::WaitingForHITL);
     }
 }

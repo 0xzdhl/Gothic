@@ -121,4 +121,3 @@ impl CustomAction for CustomActionExample {
         })
     }
 }
-
