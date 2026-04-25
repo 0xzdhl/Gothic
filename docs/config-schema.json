@@ -34,6 +34,12 @@
             "minimum": 1,
             "default": 5
         },
+        "max_task_action_retry": {
+            "type": "integer",
+            "description": "The maximum attempt for task actions, command execution, questions, .etc.",
+            "minimum": 1,
+            "default": 3
+        },
         "model": {
             "type": "object",
             "description": "LLM Configuration.",

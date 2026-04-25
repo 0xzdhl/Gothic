@@ -53,6 +53,10 @@ fn default_max_concurrent_task() -> u32 {
     5
 }
 
+fn default_max_task_action_retry() -> u32 {
+    3
+}
+
 #[derive(Deserialize, Debug)]
 pub struct Config {
     pub trae_executable_path: String,
@@ -64,6 +68,10 @@ pub struct Config {
     pub model: ModelConfig,
     #[serde(default = "default_max_concurrent_task")]
     pub max_concurrent_task: u32,
+    /// Retry actionable UI flows such as Interrupted/WaitingForHITL a few times
+    /// before giving up and warning in the console.
+    #[serde(default = "default_max_task_action_retry")]
+    pub max_task_action_retry: u32,
 }
 
 impl Config {
