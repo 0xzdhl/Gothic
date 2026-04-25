@@ -2,3 +2,4 @@
 
 # ignore configuration
 config.jsonc
+logs/**

@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::watch::Receiver;
 use tokio::sync::{Mutex, MutexGuard, RwLock};
 use tokio::time::{self, Duration, Instant, sleep};
+use tracing::{error, info, warn};
 
 // TODO: Refactor
 
@@ -511,7 +512,7 @@ impl TraeEditor {
         *guard = latest;
 
         for task in warned_tasks {
-            eprintln!(
+            warn!(
                 "Warning: [#{} {}] is still {} after {} automation attempts; stop retrying until the status changes.",
                 task.task_id,
                 task.title,
@@ -551,7 +552,7 @@ impl TraeEditor {
         events: Vec<TaskStatusChangeEvent>,
     ) {
         for event in events {
-            println!(
+            info!(
                 "Task event: [#{} {}] {} -> {}",
                 event.task.task_id,
                 event.task.title,
@@ -565,7 +566,7 @@ impl TraeEditor {
             if event.previous_status == Some(event.current_status())
                 && should_retry_task_action(event.current_status())
             {
-                println!(
+                warn!(
                     "Retrying task action: [#{} {}] still at {}",
                     event.task.task_id,
                     event.task.title,
@@ -597,7 +598,7 @@ impl TraeEditor {
             }
 
             if let Err(err) = result {
-                eprintln!("handle_task_status_change failed: {err:?}")
+                error!("handle_task_status_change failed: {err:?}")
             }
         }
     }
@@ -877,7 +878,7 @@ impl TraeEditor {
             self.confirm_delete_command().await?;
         }
 
-        println!(
+        info!(
             "{} Command: {}",
             decision.log_label(),
             pending_command.raw_command
@@ -1410,7 +1411,7 @@ impl TraeEditor {
                 bail!("Cannot find the questionnaire cancel button.");
             }
 
-            println!("Skipped Question: {}", question.question);
+            info!("Skipped question: {}", question.question);
             sleep(Duration::from_millis(300)).await;
             return Ok(());
         }
@@ -1428,7 +1429,7 @@ impl TraeEditor {
                 bail!("Cannot find the questionnaire primary action button.");
             }
 
-            println!("Submitted Text Question Empty: {}", question.question);
+            info!("Submitted empty text question: {}", question.question);
 
             return Ok(());
         }
@@ -1456,7 +1457,7 @@ impl TraeEditor {
             .collect::<Vec<_>>()
             .join(", ");
 
-        println!(
+        info!(
             "Answered Question: {} -> {}",
             question.question, selected_titles
         );
@@ -1663,7 +1664,7 @@ impl TraeEditor {
             let _ui_guard = self.acquire_ui_lock().await;
             match self.bootstrap_tasks_with_events(initial_policy).await {
                 Ok(events) => self.dispatch_task_events(&workflow, events).await,
-                Err(err) => eprintln!("bootstrap_tasks_with_events failed: {err:?}"),
+                Err(err) => error!("bootstrap_tasks_with_events failed: {err:?}"),
             }
         }
 
@@ -1680,7 +1681,7 @@ impl TraeEditor {
                         Ok(events) => {
                             self.dispatch_task_events(&workflow, events).await;
                         }
-                        Err(err) => eprintln!("refresh_tasks_with_events failed: {err:?}"),
+                        Err(err) => error!("refresh_tasks_with_events failed: {err:?}"),
                     }
                 }
                 changed = shutdown_rx.changed() => {

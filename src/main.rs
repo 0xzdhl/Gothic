@@ -1,7 +1,7 @@
-use anyhow::Result;
 use chromiumoxide::Browser;
 use futures::StreamExt;
 use gothic::config::Config;
+use gothic::logging::init_logging;
 use gothic::trae::{
     ActionChain, CustomActionExample, InitialTaskPolicy, TaskWorkflow, TraeEditor, TraeEditorMode,
 };
@@ -11,10 +11,15 @@ use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::time::{Duration, sleep};
+use tracing::{debug, error, info};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// Load config and logging
     let config = Config::load()?;
+    let _logging = init_logging(&config.logging)?;
+
+    info!("Logging initialized");
 
     let mut trae_main = Command::new(&config.trae_executable_path)
         .arg("--remote-debugging-port=9222")
@@ -26,13 +31,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // let trae_pid = trae_main.id().expect("Cannot get Trae PID.");
 
-    println!("Hello, world!");
-
     wait_for_debug_port(9222, Duration::from_secs(30)).await?;
 
     // connect to CDP
     let (mut browser, mut handler) = Browser::connect("http://127.0.0.1:9222").await?;
-    println!("Successfully connect to Trae via CDP: 127.0.0.1:9222");
+    info!("Successfully connected to Trae via CDP: 127.0.0.1:9222");
 
     // spawn a new task that continuously polls the handler
     let handle = tokio::spawn(async move {
@@ -40,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match event {
                 Ok(_) => {}
                 Err(e) => {
-                    eprintln!("Handler error: {e}");
+                    error!("Browser event handler failed: {e}");
                     break;
                 }
             }
@@ -53,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    println!("Current Trae Mode: {:?}", trae_editor.mode);
+    info!("Current Trae mode: {:?}", trae_editor.mode);
     // switch mode
     trae_editor.switch_editor_mode(TraeEditorMode::SOLO).await?;
 
@@ -87,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let tasks = arc_editor.cached_tasks().await;
 
-    println!("Tasks: {:#?}", tasks);
+    debug!(tasks = ?tasks, "Cached tasks snapshot");
 
     // click the second task
 
@@ -138,8 +141,8 @@ async fn quick_task(prompt: &str, editor: &TraeEditor) {
 
     // execute task
     match task.execute().await {
-        Ok(_) => println!("✅️ Task executed successfully. ({})", prompt),
-        Err(e) => eprintln!("Task execution failed: {e}"),
+        Ok(_) => info!("Task executed successfully. ({})", prompt),
+        Err(e) => error!("Task execution failed. ({}): {e}", prompt),
     }
 
     // sleep 1 sec

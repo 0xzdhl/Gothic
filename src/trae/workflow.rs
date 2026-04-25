@@ -4,6 +4,7 @@ use crate::trae::{ActionContext, CustomAction};
 use anyhow::Result;
 use std::collections::HashMap;
 use tokio::time::{Duration, sleep};
+use tracing::info;
 
 /// Compare the previous reconciled task list with the latest reconciled task list.
 ///
@@ -116,7 +117,7 @@ impl CustomAction for CustomActionExample {
             ctx.editor.focus_task_by_id(ctx.task.task_id).await?;
             ctx.editor.focus_chat_input().await?;
             ctx.editor.clear_chat_input().await?;
-            println!("Custom Action Triggered");
+            info!("Custom action triggered");
             Ok(())
         })
     }
