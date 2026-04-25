@@ -21,7 +21,7 @@ pub fn init_logging(config: &LoggingConfig) -> Result<LoggingGuards> {
         .lossy(false)
         .finish(std::io::stderr());
 
-    let file_appender = rolling::never(&config.directory, LOG_FILE_NAME);
+    let file_appender = rolling::daily(&config.directory, LOG_FILE_NAME);
     let (file_writer, file_guard) = NonBlockingBuilder::default()
         .lossy(false)
         .finish(file_appender);
