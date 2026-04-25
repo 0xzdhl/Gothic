@@ -40,6 +40,22 @@
             "minimum": 1,
             "default": 3
         },
+        "logging": {
+            "type": "object",
+            "description": "Logging configuration.",
+            "properties": {
+                "directory": {
+                    "type": "string",
+                    "description": "Directory used to store Gothic log files.",
+                    "default": "logs"
+                },
+                "level": {
+                    "type": "string",
+                    "description": "Default tracing filter when RUST_LOG is not set. (info, warn, debug, error)",
+                    "default": "info"
+                }
+            }
+        },
         "model": {
             "type": "object",
             "description": "LLM Configuration.",

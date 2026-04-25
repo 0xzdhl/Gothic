@@ -5,6 +5,10 @@
 	"trae_executable_path": "",
 	"command_strategy": "allow",
 	"question_strategy": "auto",
+	"logging": {
+		"directory": "logs",
+		"level": "info"
+	},
 	"max_concurrent_task": 5,
 	"max_task_action_retry": 3,
 	"model": {

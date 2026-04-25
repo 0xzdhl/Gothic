@@ -7,6 +7,14 @@ fn default_model_name() -> String {
     "gpt-5-mini".to_string()
 }
 
+fn default_log_directory() -> String {
+    "logs".to_string()
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct ModelConfig {
     pub api_key: String,
@@ -21,6 +29,23 @@ impl Default for ModelConfig {
             api_key: String::new(),
             base_url: String::new(),
             model_name: default_model_name(),
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct LoggingConfig {
+    #[serde(default = "default_log_directory")]
+    pub directory: String,
+    #[serde(default = "default_log_level")]
+    pub level: String,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            directory: default_log_directory(),
+            level: default_log_level(),
         }
     }
 }
@@ -66,6 +91,8 @@ pub struct Config {
     pub question_strategy: QuestionStrategy,
     #[serde(default)]
     pub model: ModelConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
     #[serde(default = "default_max_concurrent_task")]
     pub max_concurrent_task: u32,
     /// Retry actionable UI flows such as Interrupted/WaitingForHITL a few times
