@@ -1,6 +1,7 @@
 use crate::trae::consts::*;
 use crate::trae::editor::TraeEditor;
 use crate::trae::types::*;
+use crate::trae::TaskListHint;
 use crate::utils::wait_for_selector;
 use anyhow::{Error, Result};
 use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
@@ -70,6 +71,7 @@ impl<'a> NewTraeTask<'a> {
         sleep(Duration::from_millis(500)).await;
 
         chat_input_element.press_key("Enter").await?;
+        self.editor.set_task_list_hint(TaskListHint::NewTaskAtFront).await;
 
         sleep(Duration::from_millis(1000)).await;
 

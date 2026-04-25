@@ -2,24 +2,39 @@ use super::editor::TraeEditor;
 use super::types::{ActionChain, ActionOp, TaskStatusChangeEvent, TaskWorkflow, TraeTask};
 use crate::trae::{ActionContext, CustomAction};
 use anyhow::Result;
+use std::collections::HashMap;
 use tokio::time::{Duration, sleep};
 
+/// Compare the previous reconciled task list with the latest reconciled task list.
+///
+/// The key rule is that identity comes from `task_id`, not from `title` or `index`.
+/// This lets us emit two independent events for duplicate titles as long as the
+/// reconciliation step has already preserved distinct ids for them.
 pub fn diff_task_status_changes(
     previous: &[TraeTask],
     latest: &[TraeTask],
 ) -> Vec<TaskStatusChangeEvent> {
+    let previous_by_id = previous
+        .iter()
+        .map(|task| (task.task_id, task))
+        .collect::<HashMap<_, _>>();
+
     latest
         .iter()
         .filter_map(|task| {
-            let previous_task = previous.get(task.index)?;
-
-            if previous_task.title != task.title {
-                return None;
+            if let Some(previous_task) = previous_by_id.get(&task.task_id) {
+                return (previous_task.status != task.status).then(|| TaskStatusChangeEvent {
+                    task: task.clone(),
+                    previous_status: Some(previous_task.status),
+                });
             }
 
-            (previous_task.status != task.status).then(|| TaskStatusChangeEvent {
+            // A brand-new task has no previous status. We only emit an initial event
+            // when the task is already actionable for automation, which keeps startup
+            // noise low for tasks that are simply still running.
+            (task.is_terminal() || task.is_waiting_for_hitl()).then(|| TaskStatusChangeEvent {
                 task: task.clone(),
-                previous_status: Some(previous_task.status),
+                previous_status: None,
             })
         })
         .collect()
@@ -34,11 +49,13 @@ pub async fn execute_action_chain(
 
     for step in &chain.steps {
         match step {
-            ActionOp::FocusTask => editor.focus_task_by_index(task.index).await?,
+            // Every task-scoped action goes through a `*_by_id` method so the editor
+            // can resolve the freshest sidebar index immediately before touching the UI.
+            ActionOp::FocusTask => editor.focus_task_by_id(task.task_id).await?,
             ActionOp::FocusChatInput => editor.focus_chat_input().await?,
             ActionOp::ClearChatInput => editor.clear_chat_input().await?,
             ActionOp::TypeText(text) => editor.insert_text_to_focused_input(text).await?,
-            ActionOp::PressEnter => editor.click_send_button_by_index(task.index).await?,
+            ActionOp::PressEnter => editor.click_send_button_by_id(task.task_id).await?,
             ActionOp::ClickSelector(selector) => editor.click_element_by_selector(selector).await?,
             ActionOp::ClickButtonByText(text) => editor.click_button_by_text(text).await?,
             ActionOp::WaitForSelector {
@@ -46,11 +63,12 @@ pub async fn execute_action_chain(
                 timeout_ms,
             } => editor.wait_until_selector(selector, *timeout_ms).await?,
             ActionOp::SleepMs(ms) => sleep(Duration::from_millis(*ms)).await,
-            ActionOp::AllowCommand => editor.allow_command_by_index(task.index).await?,
-            ActionOp::RejectCommand => editor.reject_command_by_index(task.index).await?,
-            // WaitingForHITL 进入这里后，不再由 workflow 假设具体卡片类型，
-            // 而是交给 editor 读取 DOM 后决定走 command 还是 questionnaire 分支。
-            ActionOp::HandleHumanInLoop => editor.handle_human_in_loop_by_index(task.index).await?,
+            ActionOp::AllowCommand => editor.allow_command_by_id(task.task_id).await?,
+            ActionOp::RejectCommand => editor.reject_command_by_id(task.task_id).await?,
+            // Once a task enters WaitingForHITL, the workflow no longer guesses
+            // which concrete prompt is visible. The editor reads the live DOM
+            // and dispatches to the appropriate command or questionnaire handler.
+            ActionOp::HandleHumanInLoop => editor.handle_human_in_loop_by_id(task.task_id).await?,
             ActionOp::Custom(action) => {
                 action
                     .run(ActionContext {
@@ -95,7 +113,7 @@ impl CustomAction for CustomActionExample {
 
     fn run<'a>(&'a self, ctx: ActionContext<'a>) -> super::ActionFuture<'a> {
         Box::pin(async move {
-            ctx.editor.focus_task_by_index(ctx.task.index).await?;
+            ctx.editor.focus_task_by_id(ctx.task.task_id).await?;
             ctx.editor.focus_chat_input().await?;
             ctx.editor.clear_chat_input().await?;
             println!("Custom Action Triggered");
@@ -103,3 +121,4 @@ impl CustomAction for CustomActionExample {
         })
     }
 }
+

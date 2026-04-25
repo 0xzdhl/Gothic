@@ -44,9 +44,20 @@ impl TraeTaskStatus {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraeTask {
+    /// Stable in-memory identity used to track the same logical task across UI reorders.
+    ///
+    /// This value is assigned by our reconciliation layer, not by Trae itself.
+    /// Unlike `index`, it is expected to remain stable for the lifetime of the process.
+    pub task_id: u64,
+    /// Human-visible title shown in the sidebar.
     pub title: String,
     pub status: TraeTaskStatus,
+    /// Whether the sidebar item is currently selected in the UI.
     pub selected: bool,
+    /// Current sidebar position in the latest UI snapshot.
+    ///
+    /// This is intentionally mutable because Trae can reorder tasks after creation,
+    /// after terminal-task follow-up input, or while other tasks are inserted above it.
     pub index: usize,
 }
 
@@ -89,6 +100,10 @@ impl<'a> TraeTaskHandler<'a> {
         &self.snapshot.title
     }
 
+    pub fn task_id(&self) -> u64 {
+        self.snapshot.task_id
+    }
+
     pub fn status(&self) -> TraeTaskStatus {
         self.snapshot.status
     }
@@ -106,28 +121,26 @@ impl<'a> TraeTaskHandler<'a> {
     }
 
     pub async fn refresh(&self) -> Result<TraeTaskHandler<'a>, Error> {
-        self.editor
-            .get_task_handle_by_index(self.snapshot.index)
-            .await
+        self.editor.get_task_handle_by_id(self.snapshot.task_id).await
     }
 
     pub async fn select(&self) -> Result<(), Error> {
         let _ui_guard = self.editor.acquire_ui_lock().await;
-        self.editor.select_task_by_index(self.index()).await
+        self.editor.select_task_by_id(self.task_id()).await
     }
 
     pub async fn type_content(&self, content: &str) -> Result<(), Error> {
         let _ui_guard = self.editor.acquire_ui_lock().await;
-        let _ = self.editor.select_task_by_index(self.index()).await?;
+        let _ = self.editor.select_task_by_id(self.task_id()).await?;
         self.editor.type_content_to_chat_input(content).await
     }
 
     pub async fn copy_summary(&self) -> Result<String, Error> {
         let _ui_guard = self.editor.acquire_ui_lock().await;
-        // switch to target task item
-        let _ = self.editor.select_task_by_index(self.index()).await?;
+        // Always refocus the latest location of the task before reading task-scoped UI.
+        let _ = self.editor.select_task_by_id(self.task_id()).await?;
 
-        let _ = self.editor.copy_task_summary_by_index(self.index()).await?;
+        let _ = self.editor.copy_task_summary_by_id(self.task_id()).await?;
 
         // read summary from clipboard
         let mut clipboard = Clipboard::new()?;
@@ -139,32 +152,30 @@ impl<'a> TraeTaskHandler<'a> {
 
     pub async fn retry_task(&self) -> Result<(), Error> {
         let _ui_guard = self.editor.acquire_ui_lock().await;
-        // switch to target task item
-        let _ = self.editor.select_task_by_index(self.index()).await?;
-        self.editor.retry_task_by_index(self.index()).await
+        // Retry operates on the currently focused task panel, so refresh the focus first.
+        let _ = self.editor.select_task_by_id(self.task_id()).await?;
+        self.editor.retry_task_by_id(self.task_id()).await
     }
 
     pub async fn feedback(&self, feedback: TraeSoloTaskFeedback) -> Result<(), Error> {
         let _ui_guard = self.editor.acquire_ui_lock().await;
-        // switch to target task item
-        let _ = self.editor.select_task_by_index(self.index()).await?;
-        self.editor
-            .feedback_task_by_index(self.index(), feedback)
-            .await
+        // Feedback buttons belong to the active task panel, not to a stable DOM node.
+        let _ = self.editor.select_task_by_id(self.task_id()).await?;
+        self.editor.feedback_task_by_id(self.task_id(), feedback).await
     }
 
     pub async fn terminate(&self) -> Result<(), Error> {
         let _ui_guard = self.editor.acquire_ui_lock().await;
-        let _ = self.editor.select_task_by_index(self.index()).await?;
+        let _ = self.editor.select_task_by_id(self.task_id()).await?;
 
-        self.editor.terminate_task_by_index(self.index()).await
+        self.editor.terminate_task_by_id(self.task_id()).await
     }
 
     pub async fn trigger_send(&self) -> Result<(), Error> {
         let _ui_guard = self.editor.acquire_ui_lock().await;
-        let _ = self.editor.select_task_by_index(self.index()).await?;
+        let _ = self.editor.select_task_by_id(self.task_id()).await?;
 
-        self.editor.click_send_button_by_index(self.index()).await
+        self.editor.click_send_button_by_id(self.task_id()).await
     }
 }
 
@@ -177,6 +188,10 @@ pub struct TaskStatusChangeEvent {
 impl TaskStatusChangeEvent {
     pub fn current_status(&self) -> TraeTaskStatus {
         self.task.status
+    }
+
+    pub fn task_id(&self) -> u64 {
+        self.task.task_id
     }
 }
 
@@ -192,9 +207,10 @@ pub enum ActionOp {
     WaitForSelector { selector: String, timeout_ms: u64 },
     AllowCommand,
     RejectCommand,
-    // WaitingForHITL 下的统一动作入口。
-    // 与其让 workflow 预先判断“当前是命令卡还是问题卡”，
-    // 不如把判断逻辑下沉到 editor 里直接看实际 DOM。
+    // Unified WaitingForHITL entry point.
+    // Instead of asking the workflow to predict whether the current prompt is a
+    // command card or a questionnaire, we defer that decision to `editor`,
+    // where we can inspect the live DOM at execution time.
     HandleHumanInLoop,
     SleepMs(u64),
     Custom(Arc<dyn CustomAction>),
@@ -268,7 +284,8 @@ impl ActionChain {
         self.then(ActionOp::RejectCommand)
     }
 
-    // 给 workflow 提供一个更语义化的 builder，避免上层继续直接拼 Allow/RejectCommand。
+    // Provide a semantic builder for the unified HITL path so callers do not
+    // need to manually compose Allow/Reject actions up front.
     pub fn handle_human_in_loop(self) -> Self {
         self.then(ActionOp::HandleHumanInLoop)
     }

@@ -19,6 +19,7 @@ use chromiumoxide::Element;
 use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
 use chromiumoxide::{Browser, Page, cdp::browser_protocol::target::TargetInfo};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::watch::Receiver;
 use tokio::sync::{Mutex, MutexGuard, RwLock};
 use tokio::time::{self, Duration, Instant, sleep};
@@ -32,16 +33,24 @@ pub struct TraeEditor {
     pub(crate) prebuilt_agent: TraeEditorPrebuiltSoloAgent,
     pub mode: TraeEditorMode,
     pub(crate) tasks: RwLock<Vec<TraeTask>>,
+    pub(crate) next_task_id: AtomicU64,
+    pub(crate) pending_task_list_hint: Mutex<Option<TaskListHint>>,
     // Serializes multi-step interactions against Trae's single focused UI.
     pub(crate) ui_lock: Mutex<()>,
     pub config: Config,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct TaskSnapshotFromUi {
     title: String,
     raw_status: String,
     selected: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TaskListHint {
+    NewTaskAtFront,
+    MoveTaskToFront { task_id: u64 },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -159,6 +168,70 @@ fn parse_task_status(raw_status: &str) -> TraeTaskStatus {
     }
 }
 
+fn build_index_mapping(
+    latest_len: usize,
+    front_gap: usize,
+    previous_indices: impl IntoIterator<Item = usize>,
+) -> Vec<Option<usize>> {
+    let mut mapping = vec![None; latest_len];
+
+    for (latest_index, previous_index) in (front_gap..latest_len).zip(previous_indices) {
+        mapping[latest_index] = Some(previous_index);
+    }
+
+    mapping
+}
+
+fn ordered_previous_indices_with_front_task(
+    previous: &[TraeTask],
+    task_id: u64,
+) -> Option<Vec<usize>> {
+    let moved_index = previous.iter().position(|task| task.task_id == task_id)?;
+    let mut indices = Vec::with_capacity(previous.len());
+    indices.push(moved_index);
+    indices.extend((0..previous.len()).filter(|index| *index != moved_index));
+    Some(indices)
+}
+
+/// Reconcile the latest sidebar snapshot using Trae's observed stable ordering rules:
+/// - a newly created task is inserted at index 0
+/// - after sending follow-up input to a terminal task, that task moves to index 0
+/// - HITL interactions do not reorder tasks
+/// - every other task preserves relative order behind the front insertion/move
+pub(crate) fn reconcile_task_snapshots(
+    previous: &[TraeTask],
+    latest_len: usize,
+    hint: Option<TaskListHint>,
+) -> Vec<Option<usize>> {
+    if previous.is_empty() {
+        return vec![None; latest_len];
+    }
+
+    if latest_len == 0 {
+        return Vec::new();
+    }
+
+    if let Some(hint) = hint {
+        match hint {
+            TaskListHint::NewTaskAtFront => {
+                return build_index_mapping(latest_len, 1, 0..previous.len());
+            }
+            TaskListHint::MoveTaskToFront { task_id } => {
+                if let Some(indices) = ordered_previous_indices_with_front_task(previous, task_id) {
+                    return build_index_mapping(latest_len, 0, indices);
+                }
+            }
+        }
+    }
+
+    let inferred_front_new_count = latest_len.saturating_sub(previous.len());
+    if inferred_front_new_count > 0 {
+        return build_index_mapping(latest_len, inferred_front_new_count, 0..previous.len());
+    }
+
+    build_index_mapping(latest_len, 0, 0..previous.len())
+}
+
 pub struct TraeEditorBuilder;
 
 impl TraeEditorBuilder {
@@ -204,6 +277,8 @@ impl TraeEditorBuilder {
             mode: current_mode,
             config,
             tasks: RwLock::new(Vec::new()),
+            next_task_id: AtomicU64::new(1),
+            pending_task_list_hint: Mutex::new(None),
             ui_lock: Mutex::new(()),
         };
     }
@@ -260,9 +335,57 @@ impl TraeEditor {
         self.prebuilt_agent
     }
 
-    // private methods
-    // get tasks from sidebar
-    pub async fn fetch_tasks_from_ui(&self) -> Result<Vec<TraeTask>, Error> {
+    /// Allocate a new process-local task id.
+    ///
+    /// This id is stable only for the current run. A future persistence layer can
+    /// replace or extend this with durable storage if needed.
+    fn allocate_task_id(&self) -> u64 {
+        self.next_task_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(crate) async fn set_task_list_hint(&self, hint: TaskListHint) {
+        *self.pending_task_list_hint.lock().await = Some(hint);
+    }
+
+    async fn take_task_list_hint(&self) -> Option<TaskListHint> {
+        self.pending_task_list_hint.lock().await.take()
+    }
+
+    /// Convert raw UI rows into tracked tasks while preserving task identity using
+    /// Trae's stable ordering rules plus the most recent known front-move hint.
+    fn materialize_tasks_from_snapshots(
+        &self,
+        previous: &[TraeTask],
+        snapshots: Vec<TaskSnapshotFromUi>,
+        hint: Option<TaskListHint>,
+    ) -> Vec<TraeTask> {
+        let mapping = reconcile_task_snapshots(previous, snapshots.len(), hint);
+
+        snapshots
+            .into_iter()
+            .enumerate()
+            .map(|(index, snapshot)| {
+                let task_id = mapping
+                    .get(index)
+                    .and_then(|previous_index| *previous_index)
+                    .and_then(|previous_index| previous.get(previous_index))
+                    .map(|task| task.task_id)
+                    .unwrap_or_else(|| self.allocate_task_id());
+
+                TraeTask {
+                    task_id,
+                    title: snapshot.title.trim().to_string(),
+                    status: parse_task_status(snapshot.raw_status.as_str()),
+                    selected: snapshot.selected,
+                    index,
+                }
+            })
+            .collect()
+    }
+
+    // Private helpers.
+    // Read the sidebar into a lightweight snapshot that contains only raw UI state.
+    async fn fetch_task_snapshots_from_ui(&self) -> Result<Vec<TaskSnapshotFromUi>, Error> {
         if self.mode != TraeEditorMode::SOLO {
             return Err(Error::msg(
                 "Cannot get tasks under IDE mode, please switch to SOLO mode.",
@@ -297,22 +420,18 @@ impl TraeEditor {
             .await?
             .into_value()?;
 
-        let mut tasks = Vec::with_capacity(task_snapshots.len());
+        Ok(task_snapshots)
+    }
 
-        for (index, snapshot) in task_snapshots.into_iter().enumerate() {
-            tasks.push(TraeTask {
-                title: snapshot.title.trim().to_string(),
-                status: parse_task_status(snapshot.raw_status.as_str()),
-                selected: snapshot.selected,
-                index,
-            });
-        }
-
-        Ok(tasks)
+    async fn fetch_tasks_from_ui(&self, previous: &[TraeTask]) -> Result<Vec<TraeTask>, Error> {
+        let task_snapshots = self.fetch_task_snapshots_from_ui().await?;
+        let hint = self.take_task_list_hint().await;
+        Ok(self.materialize_tasks_from_snapshots(previous, task_snapshots, hint))
     }
 
     pub async fn refresh_tasks(&self) -> Result<Vec<TraeTask>, Error> {
-        let latest = self.fetch_tasks_from_ui().await?;
+        let previous = self.cached_tasks().await;
+        let latest = self.fetch_tasks_from_ui(&previous).await?;
 
         let mut guard = self.tasks.write().await;
         *guard = latest.clone();
@@ -322,7 +441,7 @@ impl TraeEditor {
 
     pub async fn refresh_tasks_with_events(&self) -> Result<Vec<TaskStatusChangeEvent>, Error> {
         let previous = self.cached_tasks().await;
-        let latest = self.fetch_tasks_from_ui().await?;
+        let latest = self.fetch_tasks_from_ui(&previous).await?;
         let events = diff_task_status_changes(&previous, &latest);
 
         let mut guard = self.tasks.write().await;
@@ -335,7 +454,8 @@ impl TraeEditor {
         &self,
         policy: InitialTaskPolicy,
     ) -> Result<Vec<TaskStatusChangeEvent>, Error> {
-        let latest = self.fetch_tasks_from_ui().await?;
+        let previous = self.cached_tasks().await;
+        let latest = self.fetch_tasks_from_ui(&previous).await?;
 
         let events = latest
             .iter()
@@ -359,7 +479,8 @@ impl TraeEditor {
     ) {
         for event in events {
             println!(
-                "Task event: [{}] {} -> {}",
+                "Task event: [#{} {}] {} -> {}",
+                event.task.task_id,
                 event.task.title,
                 event
                     .previous_status
@@ -374,7 +495,8 @@ impl TraeEditor {
         }
     }
 
-    pub async fn focus_task_by_index(&self, index: usize) -> Result<(), Error> {
+    pub async fn focus_task_by_id(&self, task_id: u64) -> Result<(), Error> {
+        let index = self.resolve_task_index_by_id(task_id).await?;
         self.select_task_by_index(index).await?;
         sleep(Duration::from_millis(300)).await;
         Ok(())
@@ -570,7 +692,8 @@ impl TraeEditor {
 
     /// Get latest Trae tasks from UI.
     pub async fn get_tasks(&self) -> Result<Vec<TraeTask>, Error> {
-        let latest = self.fetch_tasks_from_ui().await?;
+        let previous = self.cached_tasks().await;
+        let latest = self.fetch_tasks_from_ui(&previous).await?;
         let mut guard = self.tasks.write().await;
         *guard = latest.clone();
 
@@ -628,11 +751,7 @@ impl TraeEditor {
         Ok(PendingCommandAction { kind, raw_command })
     }
 
-    async fn handle_command_by_index(
-        &self,
-        index: usize,
-        decision: CommandDecision,
-    ) -> Result<(), Error> {
+    async fn handle_command(&self, index: usize, decision: CommandDecision) -> Result<(), Error> {
         let pending_command = self.resolve_pending_command_action(index).await?;
 
         let action_button = wait_for_selector(
@@ -662,14 +781,14 @@ impl TraeEditor {
         Ok(())
     }
 
-    pub async fn allow_command_by_index(&self, index: usize) -> Result<(), Error> {
-        self.handle_command_by_index(index, CommandDecision::Allow)
-            .await
+    pub async fn allow_command_by_id(&self, task_id: u64) -> Result<(), Error> {
+        let index = self.resolve_task_index_by_id(task_id).await?;
+        self.handle_command(index, CommandDecision::Allow).await
     }
 
-    pub async fn reject_command_by_index(&self, index: usize) -> Result<(), Error> {
-        self.handle_command_by_index(index, CommandDecision::Reject)
-            .await
+    pub async fn reject_command_by_id(&self, task_id: u64) -> Result<(), Error> {
+        let index = self.resolve_task_index_by_id(task_id).await?;
+        self.handle_command(index, CommandDecision::Reject).await
     }
 
     async fn detect_hitl_prompt_kind(&self) -> Result<Option<HitlPromptKind>, Error> {
@@ -722,23 +841,29 @@ impl TraeEditor {
         ))
     }
 
-    async fn handle_configured_command_by_index(&self, index: usize) -> Result<(), Error> {
+    async fn handle_configured_command(&self, index: usize) -> Result<(), Error> {
         match self.config.command_strategy {
-            CommandStrategy::Allow => self.allow_command_by_index(index).await,
-            CommandStrategy::Deny => self.reject_command_by_index(index).await,
+            CommandStrategy::Allow => self.handle_command(index, CommandDecision::Allow).await,
+            CommandStrategy::Deny => self.handle_command(index, CommandDecision::Reject).await,
             CommandStrategy::LLM => Err(Error::msg(
                 "command_strategy = \"llm\" is not implemented yet. Use \"allow\" or \"deny\".",
             )),
         }
     }
 
-    async fn answer_questionnaire_by_index(&self, index: usize) -> Result<(), Error> {
-        self.select_task_by_index(index).await?;
+    async fn handle_configured_command_by_id(&self, task_id: u64) -> Result<(), Error> {
+        let index = self.resolve_task_index_by_id(task_id).await?;
+        self.handle_configured_command(index).await
+    }
 
-        // QUESTION_MAX_STEPS is a safety valve for infinite loop
+    async fn answer_questionnaire(&self, task_id: u64) -> Result<(), Error> {
+        self.select_task_by_id(task_id).await?;
+
+        // QUESTION_MAX_STEPS prevents an infinite loop if Trae keeps returning
+        // the same question or the DOM never transitions to the next step.
         for step in 0..QUESTION_MAX_STEPS {
             let Some(question) = self.extract_questionnaire().await? else {
-                // No question card found, throw an error
+                // If the very first read fails, the handler likely targeted the wrong UI state.
                 if step == 0 {
                     bail!("Cannot find a pending questionnaire card.");
                 }
@@ -749,7 +874,8 @@ impl TraeEditor {
             let signature = Self::questionnaire_signature(&question);
             self.answer_current_questionnaire(&question).await?;
 
-            // 给页面一点时间完成切换动画 / DOM 更新，减少立刻检查造成的假阴性。
+            // Allow transition animations and DOM updates to settle before we check
+            // whether the question changed. This avoids false negatives right after click.
             sleep(Duration::from_millis(1000)).await;
 
             if matches!(self.config.question_strategy, QuestionStrategy::Skip) {
@@ -850,20 +976,19 @@ impl TraeEditor {
             .into_value()?)
     }
 
-    /// WaitingForHITL handler
-    pub async fn handle_human_in_loop_by_index(&self, index: usize) -> Result<(), Error> {
-        self.select_task_by_index(index).await?;
+    pub async fn handle_human_in_loop_by_id(&self, task_id: u64) -> Result<(), Error> {
+        self.select_task_by_id(task_id).await?;
 
         match self.wait_for_hitl_prompt_kind().await? {
-            HitlPromptKind::Command => self.handle_configured_command_by_index(index).await,
-            HitlPromptKind::Questionnaire => self.answer_questionnaire_by_index(index).await,
+            HitlPromptKind::Command => self.handle_configured_command_by_id(task_id).await,
+            HitlPromptKind::Questionnaire => self.answer_questionnaire(task_id).await,
         }
     }
 
     /// Generate a signature to check if the question is correctly handled
-    /// 1. question title may change sometime
-    /// 2. a question may contains multi options and perhaps a textarea
-    /// 3. encode question, option titles and textarea
+    /// 1. question title may change
+    /// 2. a question may contain multiple options and an optional textarea
+    /// 3. therefore we encode the visible structure instead of only the title
     fn questionnaire_signature(question: &Questionnaire) -> String {
         let option_titles = question
             .options
@@ -1232,8 +1357,8 @@ impl TraeEditor {
         Ok(())
     }
 
-    pub async fn terminate_task_by_index(&self, index: usize) -> Result<(), Error> {
-        let task = self.get_task_by_index(index).await?;
+    pub async fn terminate_task_by_id(&self, task_id: u64) -> Result<(), Error> {
+        let task = self.get_task_by_id(task_id).await?;
         match task.status {
             TraeTaskStatus::Running | TraeTaskStatus::WaitingForHITL => {
                 self.click_element_by_selector("button[class*=chat-input-v2-send-button]")
@@ -1245,12 +1370,27 @@ impl TraeEditor {
         }
     }
 
-    pub async fn click_send_button_by_index(&self, index: usize) -> Result<(), Error> {
-        let task = self.get_task_by_index(index).await?;
+    pub async fn click_send_button_by_id(&self, task_id: u64) -> Result<(), Error> {
+        let task = self.get_task_by_id(task_id).await?;
         match task.status {
             TraeTaskStatus::Finished | TraeTaskStatus::Interrupted | TraeTaskStatus::Idle => {
                 self.click_element_by_selector("button[class*=chat-input-v2-send-button]")
-                    .await
+                    .await?;
+
+                if matches!(
+                    task.status,
+                    TraeTaskStatus::Finished | TraeTaskStatus::Interrupted
+                ) {
+                    self.set_task_list_hint(TaskListHint::MoveTaskToFront {
+                        task_id: task.task_id,
+                    })
+                    .await;
+
+                    sleep(Duration::from_millis(500)).await;
+                    let _ = self.refresh_tasks().await;
+                }
+
+                Ok(())
             }
             _ => Err(Error::msg(
                 "You cannot click send button as this task is still running. Invoke `terminate` method first.",
@@ -1258,27 +1398,28 @@ impl TraeEditor {
         }
     }
 
-    async fn get_task_by_index(&self, index: usize) -> Result<TraeTask, Error> {
+    pub async fn get_task_by_id(&self, task_id: u64) -> Result<TraeTask, Error> {
         let latest_tasks = self.get_tasks().await?;
 
-        let target = latest_tasks
-            .get(index)
-            .cloned()
-            .ok_or_else(|| Error::msg(format!("Cannot find task by index: {}", index)))?;
-
-        Ok(target)
+        latest_tasks
+            .into_iter()
+            .find(|task| task.task_id == task_id)
+            .ok_or_else(|| Error::msg(format!("Cannot find task by task_id: {task_id}")))
     }
 
-    pub async fn get_task_handle_by_index(
-        &self,
-        index: usize,
-    ) -> Result<TraeTaskHandler<'_>, Error> {
-        let task = self.get_task_by_index(index).await?;
+    async fn resolve_task_index_by_id(&self, task_id: u64) -> Result<usize, Error> {
+        // This lookup is intentionally late-bound. Index is mutable, while `task_id`
+        // is stable for the life of the process.
+        Ok(self.get_task_by_id(task_id).await?.index)
+    }
+
+    pub async fn get_task_handle_by_id(&self, task_id: u64) -> Result<TraeTaskHandler<'_>, Error> {
+        let task = self.get_task_by_id(task_id).await?;
         Ok(TraeTaskHandler::new(self, task))
     }
 
     /// Operations
-    pub async fn select_task_by_index(&self, index: usize) -> Result<(), Error> {
+    async fn select_task_by_index(&self, index: usize) -> Result<(), Error> {
         let _ = wait_for_selector(
             &self.main_page,
             "#solo-ai-sidebar-content div[class*=task-items-list]",
@@ -1319,6 +1460,11 @@ impl TraeEditor {
         Ok(())
     }
 
+    pub async fn select_task_by_id(&self, task_id: u64) -> Result<(), Error> {
+        let index = self.resolve_task_index_by_id(task_id).await?;
+        self.select_task_by_index(index).await
+    }
+
     pub async fn type_content_to_chat_input(&self, content: &str) -> Result<(), Error> {
         self.focus_chat_input().await?;
         self.clear_chat_input().await?;
@@ -1327,23 +1473,19 @@ impl TraeEditor {
         Ok(())
     }
 
-    async fn is_interoperable(&self, index: usize) -> Result<(), Error> {
-        let task = self.get_task_by_index(index).await?;
+    async fn is_interoperable_by_id(&self, task_id: u64) -> Result<(), Error> {
+        let task = self.get_task_by_id(task_id).await?;
 
         match task.status {
             TraeTaskStatus::Finished | TraeTaskStatus::Interrupted => Ok(()),
-            _ => {
-                return Err(Error::msg(
-                    "Actions can only be trigger under Finished/Interrupted status.",
-                ));
-            }
+            _ => Err(Error::msg(
+                "Actions can only be trigger under Finished/Interrupted status.",
+            )),
         }
     }
 
-    pub async fn copy_task_summary_by_index(&self, index: usize) -> Result<(), Error> {
-        // status guard
-        self.is_interoperable(index).await?;
-
+    pub async fn copy_task_summary_by_id(&self, task_id: u64) -> Result<(), Error> {
+        self.is_interoperable_by_id(task_id).await?;
         let copy_summary_button = wait_for_selector(
             &self.main_page,
             "button[aria-label=复制全部]",
@@ -1354,15 +1496,12 @@ impl TraeEditor {
         copy_summary_button.click().await?;
         Ok(())
     }
-
-    pub async fn feedback_task_by_index(
+    pub async fn feedback_task_by_id(
         &self,
-        index: usize,
+        task_id: u64,
         feedback: TraeSoloTaskFeedback,
     ) -> Result<(), Error> {
-        // status guard
-        self.is_interoperable(index).await?;
-
+        self.is_interoperable_by_id(task_id).await?;
         match feedback {
             TraeSoloTaskFeedback::Good => {
                 let feedback_good_button = wait_for_selector(
@@ -1388,11 +1527,8 @@ impl TraeEditor {
 
         Ok(())
     }
-
-    pub async fn retry_task_by_index(&self, index: usize) -> Result<(), Error> {
-        // status guard
-        self.is_interoperable(index).await?;
-
+    pub async fn retry_task_by_id(&self, task_id: u64) -> Result<(), Error> {
+        self.is_interoperable_by_id(task_id).await?;
         let retry_button = wait_for_selector(
             &self.main_page,
             "button[aria-label=重试]",
@@ -1449,5 +1585,137 @@ impl TraeEditor {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::editor::{TaskListHint, reconcile_task_snapshots};
+    use super::super::types::{TraeTask, TraeTaskStatus};
+    use super::super::workflow::diff_task_status_changes;
+
+    fn task(
+        task_id: u64,
+        title: &str,
+        status: TraeTaskStatus,
+        selected: bool,
+        index: usize,
+    ) -> TraeTask {
+        TraeTask {
+            task_id,
+            title: title.to_string(),
+            status,
+            selected,
+            index,
+        }
+    }
+
+    #[test]
+    fn reconcile_keeps_stable_order_without_hint() {
+        let previous = vec![
+            task(1, "Build website", TraeTaskStatus::Running, false, 0),
+            task(2, "Build website", TraeTaskStatus::WaitingForHITL, true, 1),
+            task(3, "Other task", TraeTaskStatus::Running, false, 2),
+        ];
+
+        assert_eq!(
+            reconcile_task_snapshots(&previous, previous.len(), None),
+            vec![Some(0), Some(1), Some(2)]
+        );
+    }
+
+    #[test]
+    fn reconcile_assigns_a_new_front_task_from_explicit_hint() {
+        let previous = vec![
+            task(11, "Existing task A", TraeTaskStatus::Running, false, 0),
+            task(
+                12,
+                "Existing task B",
+                TraeTaskStatus::WaitingForHITL,
+                true,
+                1,
+            ),
+        ];
+
+        assert_eq!(
+            reconcile_task_snapshots(&previous, 3, Some(TaskListHint::NewTaskAtFront)),
+            vec![None, Some(0), Some(1)]
+        );
+    }
+
+    #[test]
+    fn reconcile_infers_new_front_tasks_from_length_growth() {
+        let previous = vec![
+            task(11, "Existing task A", TraeTaskStatus::Running, false, 0),
+            task(
+                12,
+                "Existing task B",
+                TraeTaskStatus::WaitingForHITL,
+                true,
+                1,
+            ),
+        ];
+
+        assert_eq!(
+            reconcile_task_snapshots(&previous, 3, None),
+            vec![None, Some(0), Some(1)]
+        );
+    }
+
+    #[test]
+    fn reconcile_moves_the_known_terminal_task_to_front() {
+        let previous = vec![
+            task(21, "Build website", TraeTaskStatus::Finished, false, 0),
+            task(22, "Build website", TraeTaskStatus::Finished, true, 1),
+            task(23, "Other task", TraeTaskStatus::Running, false, 2),
+        ];
+
+        assert_eq!(
+            reconcile_task_snapshots(
+                &previous,
+                3,
+                Some(TaskListHint::MoveTaskToFront { task_id: 22 }),
+            ),
+            vec![Some(1), Some(0), Some(2)]
+        );
+    }
+
+    #[test]
+    fn diff_uses_task_id_for_duplicate_titles() {
+        let previous = vec![
+            task(1, "Build website", TraeTaskStatus::WaitingForHITL, false, 0),
+            task(2, "Build website", TraeTaskStatus::Running, false, 1),
+        ];
+        let latest = vec![
+            task(1, "Build website", TraeTaskStatus::Running, false, 1),
+            task(2, "Build website", TraeTaskStatus::WaitingForHITL, false, 0),
+        ];
+
+        let events = diff_task_status_changes(&previous, &latest);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].task_id(), 1);
+        assert_eq!(
+            events[0].previous_status,
+            Some(TraeTaskStatus::WaitingForHITL)
+        );
+        assert_eq!(events[1].task_id(), 2);
+        assert_eq!(events[1].previous_status, Some(TraeTaskStatus::Running));
+    }
+
+    #[test]
+    fn diff_emits_initial_event_for_new_waiting_task() {
+        let previous = vec![task(1, "Existing task", TraeTaskStatus::Running, false, 0)];
+        let latest = vec![
+            task(2, "New task", TraeTaskStatus::WaitingForHITL, false, 0),
+            task(1, "Existing task", TraeTaskStatus::Running, false, 1),
+        ];
+
+        let events = diff_task_status_changes(&previous, &latest);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].task_id(), 2);
+        assert_eq!(events[0].previous_status, None);
+        assert_eq!(events[0].current_status(), TraeTaskStatus::WaitingForHITL);
     }
 }

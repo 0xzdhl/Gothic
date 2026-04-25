@@ -94,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if tasks.len() > 3 {
         let second_task = tasks.get(1).unwrap();
         let second_task_handler = arc_editor
-            .get_task_handle_by_index(second_task.index)
+            .get_task_handle_by_id(second_task.task_id)
             .await?;
 
         // trigger selection
@@ -107,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // let third_task = tasks.get(2).unwrap();
         // let third_task_handler = arc_editor
-        //     .get_task_handle_by_index(third_task.index)
+        //     .get_task_handle_by_id(third_task.task_id)
         //     .await?;
 
         // let text_summary = third_task_handler.copy_summary().await?;
@@ -158,9 +158,6 @@ fn build_task_workflow() -> TaskWorkflow {
             .sleep_ms(1000)
             .press_enter(),
 
-        // WaitingForHITL 现在统一走 `handle_human_in_loop`：
-        // editor 会根据实际弹出的 DOM 自动分发到 command / questionnaire。
-        // 这样 workflow 层就不需要预先知道当前是哪一种 HITL 场景。
         on_waiting_for_hitl: ActionChain::new()
             .focus_task()
             .sleep_ms(1000)
