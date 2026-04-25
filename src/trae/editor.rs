@@ -31,7 +31,6 @@ use tracing::{error, info, warn};
 #[derive(Debug)]
 pub struct TraeEditor {
     pub(crate) main_page: Page,
-    pub(crate) target: TargetInfo,
     pub(crate) prebuilt_agent: TraeEditorPrebuiltSoloAgent,
     pub mode: TraeEditorMode,
     pub(crate) tasks: RwLock<Vec<TraeTask>>,
@@ -329,7 +328,6 @@ impl TraeEditorBuilder {
             .expect("Cannot get current mode when initializing.");
 
         return TraeEditor {
-            target: main_target,
             main_page: main_page,
             prebuilt_agent: TraeEditorPrebuiltSoloAgent::Coder,
             mode: current_mode,

@@ -15,7 +15,7 @@ use tracing::{debug, error, info};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// Load config and logging
+    // Load config and logging
     let config = Config::load()?;
     let _logging = init_logging(&config.logging)?;
 
