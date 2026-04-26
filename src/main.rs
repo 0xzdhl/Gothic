@@ -67,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // sleep 3 secs
     sleep(Duration::from_millis(3000)).await;
     // get tasks from panel
+    let task_poll_interval = Duration::from_millis(trae_editor.config.task_poll_interval_ms);
     let arc_editor = Arc::new(trae_editor);
     let arc_editor_for_loop = Arc::clone(&arc_editor);
 
@@ -75,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         arc_editor_for_loop
             .run_task_sync_loop(
-                Duration::from_secs(2),
+                task_poll_interval,
                 workflow,
                 InitialTaskPolicy::EmitTerminalAndWaiting,
                 shutdown_rx,

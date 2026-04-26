@@ -82,6 +82,10 @@ fn default_max_task_action_retry() -> u32 {
     3
 }
 
+fn default_task_poll_interval_ms() -> u64 {
+    2000
+}
+
 #[derive(Deserialize, Debug)]
 pub struct Config {
     pub trae_executable_path: String,
@@ -99,6 +103,9 @@ pub struct Config {
     /// before giving up and warning in the console.
     #[serde(default = "default_max_task_action_retry")]
     pub max_task_action_retry: u32,
+    /// Poll interval for syncing Trae sidebar task updates.
+    #[serde(default = "default_task_poll_interval_ms")]
+    pub task_poll_interval_ms: u64,
 }
 
 impl Config {

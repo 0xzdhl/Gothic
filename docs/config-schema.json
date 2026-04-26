@@ -40,6 +40,12 @@
             "minimum": 1,
             "default": 3
         },
+        "task_poll_interval_ms": {
+            "type": "integer",
+            "description": "Polling interval used to sync Trae sidebar task updates, including title changes.",
+            "minimum": 100,
+            "default": 2000
+        },
         "logging": {
             "type": "object",
             "description": "Logging configuration.",
