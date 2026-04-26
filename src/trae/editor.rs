@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::watch::Receiver;
 use tokio::sync::{Mutex, MutexGuard, RwLock};
 use tokio::time::{self, Duration, Instant, sleep};
-use tracing::{error, info, warn};
+use tracing::{error, info, instrument, warn};
 
 // TODO: Refactor
 
@@ -550,54 +550,67 @@ impl TraeEditor {
         events: Vec<TaskStatusChangeEvent>,
     ) {
         for event in events {
-            info!(
-                "Task event: [#{} {}] {} -> {}",
+            self.dispatch_task_event(workflow, event).await;
+        }
+    }
+
+    #[instrument(
+        skip(self, workflow),
+        fields(
+            task_id = event.task.task_id,
+            task_title = %event.task.title,
+            previous_status = ?event.previous_status,
+            current_status = ?event.task.status
+        )
+    )]
+    async fn dispatch_task_event(&self, workflow: &TaskWorkflow, event: TaskStatusChangeEvent) {
+        info!(
+            "Task event: [#{} {}] {} -> {}",
+            event.task.task_id,
+            event.task.title,
+            event
+                .previous_status
+                .map(|s| s.as_str())
+                .unwrap_or("Initial"),
+            event.current_status().as_str(),
+        );
+
+        if event.previous_status == Some(event.current_status())
+            && should_retry_task_action(event.current_status())
+        {
+            warn!(
+                "Retrying task action: [#{} {}] still at {}",
                 event.task.task_id,
                 event.task.title,
-                event
-                    .previous_status
-                    .map(|s| s.as_str())
-                    .unwrap_or("Initial"),
                 event.current_status().as_str(),
             );
+        }
 
-            if event.previous_status == Some(event.current_status())
-                && should_retry_task_action(event.current_status())
-            {
-                warn!(
-                    "Retrying task action: [#{} {}] still at {}",
-                    event.task.task_id,
-                    event.task.title,
-                    event.current_status().as_str(),
-                );
+        let result = handle_task_status_change(self, workflow, &event).await;
+
+        if should_retry_task_action(event.current_status()) {
+            let mut guard = self.pending_action_retries.lock().await;
+            let entry = guard
+                .entry(event.task.task_id)
+                .or_insert(PendingUiActionRetry {
+                    status: event.current_status(),
+                    attempts: 0,
+                    warned: false,
+                });
+
+            if entry.status != event.current_status() {
+                *entry = PendingUiActionRetry {
+                    status: event.current_status(),
+                    attempts: 0,
+                    warned: false,
+                };
             }
 
-            let result = handle_task_status_change(self, workflow, &event).await;
+            entry.attempts += 1;
+        }
 
-            if should_retry_task_action(event.current_status()) {
-                let mut guard = self.pending_action_retries.lock().await;
-                let entry = guard
-                    .entry(event.task.task_id)
-                    .or_insert(PendingUiActionRetry {
-                        status: event.current_status(),
-                        attempts: 0,
-                        warned: false,
-                    });
-
-                if entry.status != event.current_status() {
-                    *entry = PendingUiActionRetry {
-                        status: event.current_status(),
-                        attempts: 0,
-                        warned: false,
-                    };
-                }
-
-                entry.attempts += 1;
-            }
-
-            if let Err(err) = result {
-                error!("handle_task_status_change failed: {err:?}")
-            }
+        if let Err(err) = result {
+            error!("handle_task_status_change failed: {err:?}")
         }
     }
 
@@ -857,6 +870,7 @@ impl TraeEditor {
         Ok(PendingCommandAction { kind, raw_command })
     }
 
+    #[instrument(skip(self), fields(task_index = index, decision = ?decision))]
     async fn handle_command(&self, index: usize, decision: CommandDecision) -> Result<(), Error> {
         let pending_command = self.resolve_pending_command_action(index).await?;
 
@@ -1082,6 +1096,7 @@ impl TraeEditor {
             .into_value()?)
     }
 
+    #[instrument(skip(self), fields(task_id = task_id))]
     pub async fn handle_human_in_loop_by_id(&self, task_id: u64) -> Result<(), Error> {
         self.select_task_by_id(task_id).await?;
 
@@ -1403,6 +1418,16 @@ impl TraeEditor {
         ))
     }
 
+    #[instrument(
+        skip(self, question),
+        fields(
+            question = %question.question,
+            option_count = question.options.len(),
+            is_multiple = question.is_multiple,
+            has_text_input = question.has_text_input,
+            strategy = ?self.config.question_strategy
+        )
+    )]
     async fn answer_current_questionnaire(&self, question: &Questionnaire) -> Result<(), Error> {
         if matches!(self.config.question_strategy, QuestionStrategy::Skip) {
             if !self.click_question_cancel_action().await? {
@@ -1650,6 +1675,10 @@ impl TraeEditor {
         self.tasks.read().await.clone()
     }
 
+    #[instrument(
+        skip(self, workflow, shutdown_rx),
+        fields(interval_ms = interval.as_millis(), initial_policy = ?initial_policy)
+    )]
     pub async fn run_task_sync_loop(
         &self,
         interval: Duration,

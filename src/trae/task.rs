@@ -6,6 +6,7 @@ use crate::utils::wait_for_selector;
 use anyhow::{Error, Result};
 use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
 use tokio::time::{Duration, sleep};
+use tracing::instrument;
 
 #[derive(Debug)]
 pub struct NewTraeTask<'a> {
@@ -28,6 +29,7 @@ impl<'a> NewTraeTask<'a> {
         ))
     }
 
+    #[instrument(skip(self), fields(prompt = %self.prompt()))]
     pub async fn execute(&self) -> Result<(), Error> {
         let _ui_guard = self.editor.acquire_ui_lock().await;
 

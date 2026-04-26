@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::time::{Duration, sleep};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, instrument};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -136,6 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[instrument(skip(editor))]
 async fn quick_task(prompt: &str, editor: &TraeEditor) {
     let task = editor.create_new_task(prompt.to_string()).await;
 
