@@ -2,9 +2,7 @@ use chromiumoxide::Browser;
 use futures::StreamExt;
 use gothic::config::Config;
 use gothic::logging::init_logging;
-use gothic::trae::{
-    ActionChain, CustomActionExample, InitialTaskPolicy, TaskWorkflow, TraeEditor, TraeEditorMode,
-};
+use gothic::trae::{ActionChain, InitialTaskPolicy, TaskWorkflow, TraeEditor, TraeEditorMode};
 use gothic::utils::{wait_for_debug_port, wait_for_shutdown};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -152,7 +150,13 @@ async fn quick_task(prompt: &str, editor: &TraeEditor) {
 
 fn build_task_workflow() -> TaskWorkflow {
     TaskWorkflow {
-        on_finished: ActionChain::new().focus_task().custom(CustomActionExample),
+        on_finished: ActionChain::new()
+            .new_task()
+            .focus_chat_input()
+            .clear_chat_input()
+            .type_text("Create new task")
+            .sleep_ms(1000)
+            .press_enter(),
 
         on_interrupted: ActionChain::new()
             .focus_task()
