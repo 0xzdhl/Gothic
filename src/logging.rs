@@ -2,7 +2,7 @@ use crate::config::LoggingConfig;
 use anyhow::Result;
 use tracing_appender::{
     non_blocking::{NonBlockingBuilder, WorkerGuard},
-    rolling,
+    rolling::{RollingFileAppender, Rotation},
 };
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -21,7 +21,11 @@ pub fn init_logging(config: &LoggingConfig) -> Result<LoggingGuards> {
         .lossy(false)
         .finish(std::io::stderr());
 
-    let file_appender = rolling::daily(&config.directory, LOG_FILE_NAME);
+    let file_appender = RollingFileAppender::builder()
+        .rotation(Rotation::DAILY)
+        .filename_prefix(LOG_FILE_NAME)
+        .filename_suffix("log")
+        .build(&config.directory)?;
     let (file_writer, file_guard) = NonBlockingBuilder::default()
         .lossy(false)
         .finish(file_appender);
@@ -43,8 +47,8 @@ pub fn init_logging(config: &LoggingConfig) -> Result<LoggingGuards> {
 
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(console_layer)
         .with(file_layer)
+        .with(console_layer)
         .try_init()?;
 
     Ok(LoggingGuards {
