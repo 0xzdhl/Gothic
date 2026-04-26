@@ -688,6 +688,44 @@ impl TraeEditor {
         Ok(())
     }
 
+    pub async fn wait_until_task_creation_page_ready(&self) -> Result<(), Error> {
+        let _ = wait_for_selector(
+            &self.main_page,
+            "div.welcome-page-solo-agent-title",
+            Duration::from_millis(DEFAULT_SELECTOR_TIMEOUT),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// The action only triggered `click` behavior, not creating task actually.
+    /// You have to invoke `type_text` and `press_enter` manually.
+    pub async fn click_create_task_button(&self) -> Result<(), Error> {
+        // Keep this helper lock-free so workflow dispatch can call it while
+        // already holding the editor-wide UI lock.
+        let _ = wait_for_selector(
+            &self.main_page,
+            "div.chat-content-container",
+            Duration::from_millis(DEFAULT_SELECTOR_TIMEOUT),
+        )
+        .await?;
+
+        let create_task_button = wait_for_selector(
+            &self.main_page,
+            r#"#solo-ai-sidebar-content div[class*="new-task-button"]"#,
+            Duration::from_millis(DEFAULT_SELECTOR_TIMEOUT),
+        )
+        .await?;
+
+        // click create button
+        create_task_button.click().await?;
+
+        self.wait_until_task_creation_page_ready().await?;
+
+        Ok(())
+    }
+
     pub async fn insert_text_to_focused_input(&self, content: &str) -> Result<(), Error> {
         self.main_page
             .execute(InsertTextParams::new(content))
@@ -1505,10 +1543,27 @@ impl TraeEditor {
         let task = self.get_task_by_id(task_id).await?;
         match task.status {
             TraeTaskStatus::Finished | TraeTaskStatus::Interrupted | TraeTaskStatus::Idle => {
+                // `PressEnter` is used both for continuing an existing terminal task
+                // and for submitting the dedicated new-task page.
+                let is_creating_new_task: bool = self
+                    .main_page
+                    .evaluate(
+                        r#"
+                    (() => document.querySelector('div.welcome-page-solo-agent-title') !== null)()
+                    "#,
+                    )
+                    .await?
+                    .into_value()?;
+
                 self.click_element_by_selector("button[class*=chat-input-v2-send-button]")
                     .await?;
 
-                if matches!(
+                if is_creating_new_task {
+                    self.set_task_list_hint(TaskListHint::NewTaskAtFront).await;
+
+                    sleep(Duration::from_millis(1000)).await;
+                    let _ = self.refresh_tasks().await;
+                } else if matches!(
                     task.status,
                     TraeTaskStatus::Finished | TraeTaskStatus::Interrupted
                 ) {

@@ -204,11 +204,16 @@ pub enum ActionOp {
     FocusTask,
     FocusChatInput,
     ClearChatInput,
+    /// The action only triggered `click` behavior, not creating task actually
+    NewTask,
     TypeText(String),
     PressEnter,
     ClickSelector(String),
     ClickButtonByText(String),
-    WaitForSelector { selector: String, timeout_ms: u64 },
+    WaitForSelector {
+        selector: String,
+        timeout_ms: u64,
+    },
     AllowCommand,
     RejectCommand,
     // Unified WaitingForHITL entry point.
@@ -246,6 +251,10 @@ impl ActionChain {
     pub fn then(mut self, step: ActionOp) -> Self {
         self.steps.push(step);
         self
+    }
+
+    pub fn new_task(self) -> Self {
+        self.then(ActionOp::NewTask)
     }
 
     pub fn focus_task(self) -> Self {

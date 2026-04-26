@@ -53,6 +53,7 @@ pub async fn execute_action_chain(
             // Every task-scoped action goes through a `*_by_id` method so the editor
             // can resolve the freshest sidebar index immediately before touching the UI.
             ActionOp::FocusTask => editor.focus_task_by_id(task.task_id).await?,
+            ActionOp::NewTask => editor.click_create_task_button().await?,
             ActionOp::FocusChatInput => editor.focus_chat_input().await?,
             ActionOp::ClearChatInput => editor.clear_chat_input().await?,
             ActionOp::TypeText(text) => editor.insert_text_to_focused_input(text).await?,
