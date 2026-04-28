@@ -1,6 +1,8 @@
+use crate::cli::{Cli, Commands, ConfigCommands, Runner};
 use chromiumoxide::Browser;
+use clap::Parser;
 use futures::StreamExt;
-use gothic::config::Config;
+use gothic::config::{self, Config, validate_config};
 use gothic::logging::init_logging;
 use gothic::trae::{ActionChain, InitialTaskPolicy, TaskWorkflow, TraeEditor, TraeEditorMode};
 use gothic::utils::{wait_for_debug_port, wait_for_shutdown};
@@ -11,126 +13,134 @@ use tokio::sync::watch;
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, instrument};
 
+mod cli;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Load config and logging
-    let config = Config::load()?;
-    let _logging = init_logging(&config.logging)?;
+    let cli = Cli::parse();
 
-    info!("Logging initialized");
+    match cli.command {
+        Commands::Run { app, tasks } => run(app, tasks).await?,
+        Commands::Config { command } => handle_config(command)?,
+    }
 
-    let mut trae_main = Command::new(&config.trae_executable_path)
-        .arg("--remote-debugging-port=9222")
-        .arg("--no-sandbox")
-        .stdout(Stdio::null()) // inherit current stream
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()?;
+    Ok(())
+}
 
-    // let trae_pid = trae_main.id().expect("Cannot get Trae PID.");
+async fn run(app: Runner, tasks: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    match app {
+        Runner::Trae => {
+            let config = Config::load()?;
+            let _logging = init_logging(&config.logging)?;
 
-    wait_for_debug_port(9222, Duration::from_secs(30)).await?;
+            info!("Logging initialized");
 
-    // connect to CDP
-    let (mut browser, mut handler) = Browser::connect("http://127.0.0.1:9222").await?;
-    info!("Successfully connected to Trae via CDP: 127.0.0.1:9222");
+            let mut trae_main = Command::new(&config.trae_executable_path)
+                .arg("--remote-debugging-port=9222")
+                .arg("--no-sandbox")
+                .stdout(Stdio::null()) // inherit current stream
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()?;
 
-    // spawn a new task that continuously polls the handler
-    let handle = tokio::spawn(async move {
-        while let Some(event) = handler.next().await {
-            match event {
-                Ok(_) => {}
-                Err(e) => {
-                    error!("Browser event handler failed: {e}");
-                    break;
+            // let trae_pid = trae_main.id().expect("Cannot get Trae PID.");
+
+            wait_for_debug_port(9222, Duration::from_secs(30)).await?;
+
+            // connect to CDP
+            let (mut browser, mut handler) = Browser::connect("http://127.0.0.1:9222").await?;
+            info!("Successfully connected to Trae via CDP: 127.0.0.1:9222");
+
+            // spawn a new task that continuously polls the handler
+            let handle = tokio::spawn(async move {
+                while let Some(event) = handler.next().await {
+                    match event {
+                        Ok(_) => {}
+                        Err(e) => {
+                            error!("Browser event handler failed: {e}");
+                            break;
+                        }
+                    }
                 }
+            });
+
+            let trae_editor_builder = TraeEditor::new();
+
+            let mut trae_editor = trae_editor_builder.build(&mut browser, config).await;
+
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            info!("Current Trae mode: {:?}", trae_editor.mode);
+
+            // switch mode
+            trae_editor.switch_editor_mode(TraeEditorMode::SOLO).await?;
+
+            // create tasks
+            for task in tasks {
+                // create a new task
+                quick_task(&task, &trae_editor).await;
             }
+
+            sleep(Duration::from_millis(3000)).await;
+
+            // get tasks from panel
+            let task_poll_interval =
+                Duration::from_millis(trae_editor.config.task_poll_interval_ms);
+            let arc_editor = Arc::new(trae_editor);
+            let arc_editor_for_loop = Arc::clone(&arc_editor);
+
+            let workflow = build_task_workflow();
+
+            // launch event loop
+            tokio::spawn(async move {
+                arc_editor_for_loop
+                    .run_task_sync_loop(
+                        task_poll_interval,
+                        workflow,
+                        InitialTaskPolicy::EmitTerminalAndWaiting,
+                        shutdown_rx,
+                    )
+                    .await;
+            });
+
+            // sleep 3 secs
+            sleep(Duration::from_millis(3000)).await;
+
+            let tasks = arc_editor.cached_tasks().await;
+
+            debug!(tasks = ?tasks, "Cached tasks snapshot");
+
+            // receive ctrl+c signal
+            wait_for_shutdown().await?;
+
+            // stop fetching
+            let _ = shutdown_tx.send(true);
+
+            // close browser
+            let _ = browser.close().await?;
+
+            // join await
+            let _ = handle.await?;
+
+            let _ = trae_main.wait().await?;
         }
-    });
-
-    let trae_editor_builder = TraeEditor::new();
-
-    let mut trae_editor = trae_editor_builder.build(&mut browser, config).await;
-
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
-    info!("Current Trae mode: {:?}", trae_editor.mode);
-    // switch mode
-    trae_editor.switch_editor_mode(TraeEditorMode::SOLO).await?;
-
-    // create a new task
-    {
-        quick_task("翻译：我喜欢使用Python编程为日语。", &trae_editor).await;
-        quick_task("帮我制作一个网站，制作之前你要先提供一些选项给我让我选择（单选+多选）要做什么类型的网站，我选完之后你再开始写", &trae_editor).await;
     }
 
-    // sleep 3 secs
-    sleep(Duration::from_millis(3000)).await;
-    // get tasks from panel
-    let task_poll_interval = Duration::from_millis(trae_editor.config.task_poll_interval_ms);
-    let arc_editor = Arc::new(trae_editor);
-    let arc_editor_for_loop = Arc::clone(&arc_editor);
+    Ok(())
+}
 
-    let workflow = build_task_workflow();
-
-    tokio::spawn(async move {
-        arc_editor_for_loop
-            .run_task_sync_loop(
-                task_poll_interval,
-                workflow,
-                InitialTaskPolicy::EmitTerminalAndWaiting,
-                shutdown_rx,
-            )
-            .await;
-    });
-
-    // sleep 3 secs
-    sleep(Duration::from_millis(3000)).await;
-
-    let tasks = arc_editor.cached_tasks().await;
-
-    debug!(tasks = ?tasks, "Cached tasks snapshot");
-
-    // click the second task
-
-    if tasks.len() > 3 {
-        let second_task = tasks.get(1).unwrap();
-        let second_task_handler = arc_editor
-            .get_task_handle_by_id(second_task.task_id)
-            .await?;
-
-        // trigger selection
-        second_task_handler.select().await?;
-
-        // try type something in it
-        second_task_handler.type_content("fuck everything.").await?;
-
-        // switch to third item, copy summary text
-
-        // let third_task = tasks.get(2).unwrap();
-        // let third_task_handler = arc_editor
-        //     .get_task_handle_by_id(third_task.task_id)
-        //     .await?;
-
-        // let text_summary = third_task_handler.copy_summary().await?;
-        // third_task_handler.type_content("test content").await?;
-
-        // println!("The text summary of the third task: {}", text_summary);
+fn handle_config(command: ConfigCommands) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        ConfigCommands::Init { path, force } => {
+            let path = config::init_config(path, force)?;
+            println!("created config: {}", path.display());
+        }
+        ConfigCommands::Check { path } => {
+            let path = config::resolve_config_path(path)?;
+            let config = config::load_config(&path)?;
+            validate_config(&config)?;
+        }
     }
-
-    // receive ctrl+c signal
-    wait_for_shutdown().await?;
-
-    // stop fetching
-    let _ = shutdown_tx.send(true);
-
-    // close browser
-    let _ = browser.close().await?;
-
-    // join await
-    let _ = handle.await?;
-
-    let _ = trae_main.wait().await?;
 
     Ok(())
 }
