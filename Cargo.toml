@@ -2,6 +2,7 @@
 name = "gothic"
 version = "0.1.0"
 edition = "2024"
+authors = ["0x0501"]
 
 [dependencies]
 anyhow = "1.0.102"
@@ -9,6 +10,7 @@ arboard = "3.6.1"
 async-openai = { version = "0.34.0", features = ["chat-completion"] }
 chromiumoxide = "0.9.1"
 clap = { version = "4.6.1", features = ["derive"] }
+crossterm = "0.29.0"
 futures = "0.3.32"
 jsonc-parser = { version = "0.32.3", features = ["serde"] }
 rand = "0.10.1"

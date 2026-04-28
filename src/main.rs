@@ -1,15 +1,28 @@
+use std::env;
+
 use crate::cli::{Cli, Commands, ConfigCommands, Runner};
 use crate::runner::run_trae;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use gothic::config::{self, validate_config};
 
 mod cli;
 mod runner;
+mod terminal;
 
 type AppResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 #[tokio::main]
 async fn main() -> AppResult<()> {
+    if env::args_os().len() == 1 {
+        terminal::clear_terminal()?;
+        print_banner();
+
+        let mut cmd = Cli::command();
+        cmd.print_help()?;
+
+        return Ok(());
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -42,4 +55,21 @@ fn handle_config(command: ConfigCommands) -> AppResult<()> {
     }
 
     Ok(())
+}
+
+fn print_banner() {
+    let authors = env!("CARGO_PKG_AUTHORS").replace(':', ", ");
+    println!(
+        r#"
+ ██████╗  ██████╗ ████████╗██╗  ██╗██╗ ██████╗
+██╔════╝ ██╔═══██╗╚══██╔══╝██║  ██║██║██╔════╝
+██║  ███╗██║   ██║   ██║   ███████║██║██║     
+██║   ██║██║   ██║   ██║   ██╔══██║██║██║     
+╚██████╔╝╚██████╔╝   ██║   ██║  ██║██║╚██████╗
+ ╚═════╝  ╚═════╝    ╚═╝   ╚═╝  ╚═╝╚═╝ ╚═════╝
+
+>_ {}
+ "#,
+        authors
+    );
 }
