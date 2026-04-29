@@ -1,0 +1,121 @@
+name: 🚀 Build and release binary
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # Build and upload artifacts
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: gothic-x86_64-unknown-linux-gnu.tar.gz
+            raw_binary: gothic-x86_64-unknown-linux-gnu
+            binary: gothic
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: gothic-x86_64-pc-windows-msvc.zip
+            raw_binary: gothic-x86_64-pc-windows-msvc.exe
+            binary: gothic
+
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: gothic-x86_64-apple-darwin.tar.gz
+            raw_binary: gothic-x86_64-apple-darwin
+            binary: gothic
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary: gothic
+            raw_binary: gothic-aarch64-apple-darwin
+            archive: gothic-aarch64-apple-darwin.tar.gz
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build binary release
+        run: cargo build --release --target ${{ matrix.target }} --verbose
+
+      - name: Package binary on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+
+          cp target/${{ matrix.target }}/release/${{ matrix.binary }} dist/${{ matrix.raw_binary }}
+          chmod +x dist/${{ matrix.raw_binary }}
+
+          cp target/${{ matrix.target }}/release/${{ matrix.binary }} dist/${{ matrix.binary }}
+          chmod +x dist/${{ matrix.binary }}
+
+          tar -czf ${{ matrix.archive }} -C dist ${{ matrix.binary }}
+
+      - name: Package binary on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist
+
+          Copy-Item target/${{ matrix.target }}/release/${{ matrix.binary }} dist/${{ matrix.raw_binary }}
+          Copy-Item target/${{ matrix.target }}/release/${{ matrix.binary }} dist/${{ matrix.binary }}
+
+          Compress-Archive -Path dist/${{ matrix.binary }} -DestinationPath dist/${{ matrix.archive }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-files-${{ matrix.target }}
+          path: |
+            dist/${{ matrix.raw_binary }}
+            dist/${{ matrix.archive }}
+  # Release package
+  release:
+    name: Create github release
+    runs-on: ubuntu-latest
+    # depend on build job
+    needs: build
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: List release assets
+        shell: bash
+        run: ls -lah release-assets
+
+      - name: Create github release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG_NAME" release-assets/* \
+            --title "$TAG_NAME" \
+            --generate-notes \
+            --verify-tag
