@@ -73,7 +73,7 @@ fn build_task_workflow() -> TaskWorkflow {
             .focus_task()
             .focus_chat_input()
             .clear_chat_input()
-            .type_text("继续")
+            .type_text("Continue")
             .sleep_ms(1000)
             .press_enter(),
 
