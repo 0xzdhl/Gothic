@@ -29,7 +29,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             archive: gothic-x86_64-pc-windows-msvc.zip
             raw_binary: gothic-x86_64-pc-windows-msvc.exe
-            binary: gothic
+            binary: gothic.exe
 
           - os: macos-latest
             target: x86_64-apple-darwin
